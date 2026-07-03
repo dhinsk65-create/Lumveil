@@ -17,6 +17,7 @@ pyinstaller ^
   --name Lumveil ^
   --icon Lumveil.ico ^
   --clean ^
+  --noconfirm ^
   lumveil.py
 
 echo [INFO] Building Associate Tool...
