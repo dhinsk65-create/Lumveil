@@ -84,6 +84,12 @@ PICTURE_MODES = {
     "鮮やか":   (0, 5, 0, 25),
 }
 
+# フォルダ内連続再生・複数ファイルD&D時の対象拡張子（open_fileのフィルタと同一）
+VIDEO_EXTS = {
+    ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v",
+    ".ts", ".m2ts", ".vob", ".ogv", ".3gp", ".rmvb", ".rm", ".hevc", ".h264",
+}
+
 
 BG_VIDEO = "#000000"
 BG_CTRL  = "#0f0f0f"
@@ -179,10 +185,7 @@ def ffmpeg_thumbnail(path, pos_sec):
     return _ffmpeg_pipe(path, pos_sec, PREV_W, PREV_H)
 
 
-def analyze_frame(path, pos_sec):
-    img = _ffmpeg_pipe(path, pos_sec, 64, 36, timeout=2.0)
-    if img is None:
-        return None
+def _frame_stats(img):
     from PIL import ImageStat
     gray = img.convert("L")
     rgb  = img.convert("RGB")
@@ -194,6 +197,27 @@ def analyze_frame(path, pos_sec):
         "lum_std":  gs.stddev[0],
         "chroma":   max(rm, gm, bm) - min(rm, gm, bm),
     }
+
+
+def analyze_frame(path, pos_sec):
+    """ベースライン確立用: 任意の時刻のフレームをffmpegで抜き出して解析する
+    （再生位置を動かさずにサンプリングする必要があるため、こちらは維持）。"""
+    img = _ffmpeg_pipe(path, pos_sec, 64, 36, timeout=2.0)
+    if img is None:
+        return None
+    return _frame_stats(img)
+
+
+def analyze_current_frame(player):
+    """リアルタイム補正用: 現在表示中のフレームをmpvから直接取得して解析する。
+    ffmpegのプロセス起動・ファイル再オープンが不要になり、AUTO稼働中の
+    CPU/ディスク負荷を大幅に減らせる（0.5秒毎にffmpegを起動していたのを廃止）。"""
+    try:
+        img = player.screenshot_raw(includes="video")
+    except Exception:
+        return None
+    img = img.resize((64, 36))
+    return _frame_stats(img)
 
 
 
@@ -211,6 +235,7 @@ class VideoPlayer:
         self._rt_targets  = {k: 0.0 for k in ("brightness", "contrast", "gamma", "saturation")}
         self._rt_current  = {k: 0.0 for k in ("brightness", "contrast", "gamma", "saturation")}
         self._rt_baseline = None
+        self._rt_thread   = None
         self._dark_thresh = 1.0
         self._pre_rt_adj  = None
 
@@ -251,6 +276,11 @@ class VideoPlayer:
         self._mode_btns    = {}
         self._a4k_btns     = {}
         self._recent_files = []
+        self._resume_positions = {}
+        self._always_on_top = False
+        self._playlist      = []
+        self._playlist_idx  = -1
+        self._ab_state      = 0   # 0=未設定 1=A地点設定済み 2=ループ中
         self.fps           = 30.0
         self.is_seeking    = False
         self._adj_vars     = {}
@@ -275,6 +305,31 @@ class VideoPlayer:
         self.player = mpv.MPV(**mpv_kwargs)
         self.player.volume = 80
 
+        # duration/pauseは変化頻度が低いため、毎ティックの問い合わせをやめて
+        # mpv側からのプロパティ変化通知をキャッシュする方式に変更（負荷軽減）。
+        # time-posは再生中ほぼ毎フレーム変化し通知が来すぎるため、従来通り
+        # 定期ポーリング（_get_time_ms）のままにしている。
+        self._cached_duration_ms = 0.0
+        self._cached_pause       = True
+        self._mpv_observer_fns   = []
+
+        @self.player.property_observer("duration")
+        def _obs_duration(_name, value):
+            self.root.after(0, self._on_duration_prop, value)
+        self._mpv_observer_fns.append(_obs_duration)
+
+        @self.player.property_observer("pause")
+        def _obs_pause(_name, value):
+            self.root.after(0, self._on_pause_prop, value)
+        self._mpv_observer_fns.append(_obs_pause)
+
+        # 連続再生: ファイル終端に達したらプレイリストの次のファイルへ自動移行
+        @self.player.property_observer("eof-reached")
+        def _obs_eof(_name, value):
+            if value:
+                self.root.after(0, self._on_eof_reached)
+        self._mpv_observer_fns.append(_obs_eof)
+
         self._load_player_settings()
 
         # ファイルロード後に調整値・GPU設定を再適用
@@ -288,12 +343,25 @@ class VideoPlayer:
         self._setup_video_click()
         self._update_loop()
         self._blend_loop()
+        self._autosave_resume_loop()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _on_close(self):
-        self._save_player_settings()
+        self._update_resume_position()
         self._save_window_settings()
+        self._rt_enabled = False
         self._rt_stop.set()
+        # AUTO自動補正のスレッドはplayer.screenshot_raw()でmpvに直接アクセスするため、
+        # 完全に停止してからterminate()しないとメインスレッドと競合してフリーズする。
+        if self._rt_thread and self._rt_thread.is_alive():
+            self._rt_thread.join(timeout=2.0)
+        # property_observerを解除せずにterminate()すると、mpvのイベントスレッドと
+        # デッドロックしてアプリが終了不能になることを確認済み。必ず先に解除する。
+        for fn in self._mpv_observer_fns:
+            try:
+                fn.unobserve_mpv_properties()
+            except Exception:
+                pass
         try:
             self.player.terminate()
         except Exception:
@@ -319,6 +387,11 @@ class VideoPlayer:
             if shot_dir:
                 self._shot_dir = shot_dir
             self._recent_files = data.get("recent_files", [])
+            self._resume_positions = data.get("resume_positions", {})
+            self._always_on_top = bool(data.get("always_on_top", False))
+            if self._always_on_top:
+                self.root.attributes("-topmost", True)
+                self._pin_btn.config(fg=COL_GRN)
         except Exception:
             pass
 
@@ -329,9 +402,39 @@ class VideoPlayer:
                     "volume": self.vol_var.get(),
                     "screenshot_dir": self._shot_dir,
                     "recent_files": self._recent_files,
+                    "resume_positions": self._resume_positions,
+                    "always_on_top": self._always_on_top,
                 }, f, ensure_ascii=False)
         except Exception:
             pass
+
+    def _toggle_always_on_top(self):
+        self._always_on_top = not self._always_on_top
+        self.root.attributes("-topmost", self._always_on_top)
+        self._pin_btn.config(fg=COL_GRN if self._always_on_top else COL_TXT)
+        self._save_player_settings()
+
+    # ── 続きから再生 ──────────────────────────────────────────────────────
+    # 動画の先頭・末尾付近は「続きから」の意味がないため保存対象から除外する。
+    _RESUME_MARGIN_SEC = 5.0
+
+    def _update_resume_position(self):
+        path = self._current_path
+        if not path:
+            return
+        pos_ms = self._get_time_ms()
+        dur_ms = self._get_duration_ms()
+        pos_sec = pos_ms / 1000.0
+        dur_sec = dur_ms / 1000.0
+        if dur_sec > 0 and self._RESUME_MARGIN_SEC < pos_sec < dur_sec - self._RESUME_MARGIN_SEC:
+            self._resume_positions[path] = pos_sec
+        else:
+            self._resume_positions.pop(path, None)
+        self._save_player_settings()
+
+    def _autosave_resume_loop(self):
+        self._update_resume_position()
+        self.root.after(10000, self._autosave_resume_loop)
 
     def _add_recent_file(self, path):
         path = os.path.abspath(path)
@@ -341,10 +444,19 @@ class VideoPlayer:
         self._save_player_settings()
 
     def _on_mpv_file_loaded(self, _event):
-        """ファイルロード後に画像調整値とノイズ設定を再適用"""
+        """ファイルロード後に画像調整値とノイズ設定を再適用し、続きの位置へシーク"""
         self.root.after(200, self._apply_all_adj)
         if self._denoise:
             self.root.after(300, lambda: self.player.command("vf", "set", "hqdn3d"))
+        resume_sec = self._resume_positions.get(self._current_path)
+        if resume_sec:
+            self.root.after(200, lambda s=resume_sec: self._resume_seek(s))
+
+    def _resume_seek(self, pos_sec):
+        try:
+            self.player.seek(pos_sec, reference="absolute", precision="exact")
+        except Exception:
+            pass
 
     def _apply_all_adj(self):
         for key, *_ in ADJ_PARAMS:
@@ -514,6 +626,11 @@ class VideoPlayer:
                                           tooltip="全画面表示")
         f.pack(side=tk.RIGHT, padx=1)
 
+        f, self._pin_btn = self._fixed_btn(right, "📌", self._toggle_always_on_top,
+                                           w=30, font=("Segoe UI", 11),
+                                           tooltip="常に手前に表示 (T)")
+        f.pack(side=tk.RIGHT, padx=1)
+
         f, _ = self._fixed_btn(right, "ⓘ", self._show_about,
                                w=24, font=("Segoe UI", 9), tooltip="Lumveilについて")
         f.pack(side=tk.RIGHT, padx=(4, 1))
@@ -524,7 +641,7 @@ class VideoPlayer:
         f.pack(side=tk.RIGHT, padx=1)
 
         f, _ = self._fixed_btn(right, "🎛", self._toggle_adj_win,
-                               w=30, font=("Segoe UI", 11), tooltip="画像調整")
+                               w=30, font=("Segoe UI", 11), tooltip="設定")
         f.pack(side=tk.RIGHT, padx=1)
 
         f, _ = self._fixed_btn(right, "⚙ GPU", self._toggle_gpu_win,
@@ -541,6 +658,11 @@ class VideoPlayer:
 
         f, _ = self._fixed_btn(right, "💬", lambda: self._show_track_menu("sub"),
                                w=30, font=("Segoe UI", 11), tooltip="字幕トラック")
+        f.pack(side=tk.RIGHT, padx=1)
+
+        f, self._ab_btn = self._fixed_btn(right, "A-B", self._toggle_ab_loop,
+                                          w=34, font=("Segoe UI", 9),
+                                          tooltip="A-Bリピート\nクリックでA地点→B地点→解除")
         f.pack(side=tk.RIGHT, padx=1)
 
         f, self._shot_btn = self._fixed_btn(right, "📷", self._take_screenshot,
@@ -853,7 +975,7 @@ class VideoPlayer:
         tk.Label(win, text="Lumveil",
                  bg=BG_ADJ, fg=COL_BLU,
                  font=("Segoe UI", 20, "bold")).pack(pady=(24, 4))
-        tk.Label(win, text="ver. 1.3",
+        tk.Label(win, text="ver. 1.4",
                  bg=BG_ADJ, fg=COL_DIM,
                  font=("Segoe UI", 9)).pack()
         tk.Frame(win, bg="#333333", height=1).pack(fill=tk.X, padx=30, pady=14)
@@ -867,14 +989,14 @@ class VideoPlayer:
 
     def _build_adj_win(self):
         win = tk.Toplevel(self.root)
-        win.title("画像調整")
+        win.title("設定")
         win.configure(bg=BG_ADJ)
         win.resizable(False, False)
         win.withdraw()
         win.protocol("WM_DELETE_WINDOW", win.withdraw)
         self._adj_win = win
 
-        tk.Label(win, text="画像調整 (MPV)", bg=BG_ADJ, fg=COL_TXT,
+        tk.Label(win, text="設定", bg=BG_ADJ, fg=COL_TXT,
                  font=("Segoe UI", 11, "bold"), pady=10).pack()
         tk.Frame(win, bg="#333333", height=1).pack(fill=tk.X, padx=12)
 
@@ -967,6 +1089,10 @@ class VideoPlayer:
 
         tk.Frame(win, bg="#333333", height=1).pack(fill=tk.X, padx=12, pady=(4, 2))
 
+        self._build_sync_controls(win)
+
+        tk.Frame(win, bg="#333333", height=1).pack(fill=tk.X, padx=12, pady=(4, 2))
+
         br = tk.Frame(win, bg=BG_ADJ, pady=8)
         br.pack()
         self._rt_btn = self._btn(br, "⚡ リアルタイム自動調整: OFF",
@@ -999,6 +1125,44 @@ class VideoPlayer:
             self._adj_win.geometry(f"+{x}+{y}")
             self._adj_win.deiconify()
             self._adj_win.lift()
+
+    # ── 字幕/音声の同期・見た目調整 ────────────────────────────────────────
+
+    def _build_sync_controls(self, win):
+        def _sync_row(label, lo, hi, default, unit, mpv_prop, fmt="{:+.1f}"):
+            row = tk.Frame(win, bg=BG_ADJ)
+            row.pack(fill=tk.X, padx=16, pady=4)
+            tk.Label(row, text=f"{label}:", width=11, anchor="w",
+                     bg=BG_ADJ, fg=COL_TXT, font=("Segoe UI", 9)).pack(side=tk.LEFT)
+            var = tk.DoubleVar(value=default)
+
+            def _apply(_=None, var=var, prop=mpv_prop):
+                try:
+                    self.player[prop] = var.get()
+                except Exception:
+                    pass
+
+            sc = ttk.Scale(row, from_=lo, to=hi, orient=tk.HORIZONTAL, variable=var,
+                           length=200, style="Adj.Horizontal.TScale", command=_apply)
+            sc.pack(side=tk.LEFT, padx=6)
+            self._fix_scale_click(sc, var, lo, hi)
+            disp = tk.StringVar(value=fmt.format(default))
+            tk.Label(row, textvariable=disp, width=6,
+                     bg=BG_ADJ, fg=COL_BLU, font=("Consolas", 9)).pack(side=tk.LEFT)
+            var.trace_add("write", lambda *_, v=var, d=disp: d.set(fmt.format(v.get())))
+            tk.Label(row, text=unit, bg=BG_ADJ, fg=COL_DIM,
+                     font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=4)
+
+            def _reset(var=var, default=default):
+                var.set(default)
+                _apply()
+            self._btn(row, "↺", _reset, bg=BG_ADJ, pad=(5, 3)).pack(side=tk.LEFT, padx=4)
+            return var
+
+        self._sub_delay_var = _sync_row("字幕遅延", -5.0, 5.0, 0.0, "秒", "sub-delay")
+        self._sub_scale_var = _sync_row("字幕サイズ", 0.5, 2.0, 1.0, "倍", "sub-scale",
+                                        fmt="{:.2f}")
+        self._audio_delay_var = _sync_row("音声遅延", -5.0, 5.0, 0.0, "秒", "audio-delay")
 
     # ── GPU設定ウィンドウ ─────────────────────────────────────────────────
 
@@ -1857,12 +2021,20 @@ class VideoPlayer:
         self.root.dnd_bind("<<Drop>>", self._on_drop)
 
     def _on_drop(self, event):
-        raw = event.data.strip()
-        if raw.startswith("{") and "}" in raw:
-            raw = raw[1:raw.index("}")]
-        path = raw.strip()
-        if os.path.isfile(path):
-            self._open_path(path)
+        try:
+            paths = self.root.tk.splitlist(event.data)
+        except Exception:
+            raw = event.data.strip()
+            if raw.startswith("{") and "}" in raw:
+                raw = raw[1:raw.index("}")]
+            paths = [raw.strip()]
+        files = [p for p in paths if os.path.isfile(p)]
+        if not files:
+            return
+        if len(files) > 1:
+            self._play_list(files, 0)
+        else:
+            self._open_path(files[0])
 
     # ── ファイルを開く ────────────────────────────────────────────────────
 
@@ -1878,16 +2050,98 @@ class VideoPlayer:
         if path:
             self._open_path(path)
 
-    def _open_path(self, path):
+    def _open_path(self, path, _from_playlist=False):
+        self._update_resume_position()  # 切り替え前のファイルの位置を保存
+        path = os.path.abspath(path)
         self._current_path = path
         self._thumb_cache.clear()
         try:
             self.player.play(path)
+            self.player["ab-loop-a"] = "no"
+            self.player["ab-loop-b"] = "no"
         except Exception:
             pass
+        self._ab_state = 0
+        self._ab_btn.config(text="A-B", fg=COL_TXT)
         self.root.title(f"Lumveil — {os.path.basename(path)}")
         self.root.after(600, self._fetch_fps)
         self._add_recent_file(path)
+        if not _from_playlist:
+            self._build_folder_playlist(path)
+
+    # ── プレイリスト・連続再生 ────────────────────────────────────────────
+
+    def _build_folder_playlist(self, path):
+        """単体でファイルを開いた際、同じフォルダ内の動画を連続再生の対象にする。"""
+        folder = os.path.dirname(path)
+        try:
+            entries = sorted(os.listdir(folder))
+        except Exception:
+            self._playlist, self._playlist_idx = [path], 0
+            return
+        files = [os.path.join(folder, f) for f in entries
+                 if os.path.splitext(f)[1].lower() in VIDEO_EXTS]
+        if path not in files:
+            files = [path]
+        self._playlist     = files
+        self._playlist_idx = files.index(path)
+
+    def _play_list(self, files, start_idx):
+        self._playlist     = files
+        self._playlist_idx = start_idx
+        self._open_path(files[start_idx], _from_playlist=True)
+
+    def _play_relative(self, delta):
+        if not self._playlist or self._playlist_idx < 0:
+            return
+        nxt = self._playlist_idx + delta
+        if 0 <= nxt < len(self._playlist):
+            self._playlist_idx = nxt
+            self._open_path(self._playlist[nxt], _from_playlist=True)
+
+    def _play_next(self):
+        self._play_relative(1)
+
+    def _play_prev(self):
+        self._play_relative(-1)
+
+    def _on_eof_reached(self):
+        if self._playlist and 0 <= self._playlist_idx < len(self._playlist) - 1:
+            self._play_next()
+
+    # ── A-Bリピート ───────────────────────────────────────────────────────
+
+    def _toggle_ab_loop(self):
+        try:
+            pos = self.player.time_pos
+        except Exception:
+            pos = None
+        if self._ab_state == 0:
+            if pos is None:
+                return
+            try:
+                self.player["ab-loop-a"] = pos
+            except Exception:
+                pass
+            self._ab_state = 1
+            self._ab_btn.config(text="A-B: A", fg=COL_YEL)
+        elif self._ab_state == 1:
+            if pos is None:
+                return
+            try:
+                self.player["ab-loop-b"] = pos
+            except Exception:
+                pass
+            self._ab_state = 2
+            self._ab_btn.config(text="A-B: ▶", fg=COL_GRN)
+        else:
+            try:
+                self.player["ab-loop-a"] = "no"
+                self.player["ab-loop-b"] = "no"
+            except Exception:
+                pass
+            self._ab_state = 0
+            self._ab_btn.config(text="A-B", fg=COL_TXT)
 
     def _fetch_fps(self):
         try:
@@ -1938,12 +2192,14 @@ class VideoPlayer:
 
     # ── シークバー ────────────────────────────────────────────────────────
 
+    def _on_duration_prop(self, value):
+        self._cached_duration_ms = (value or 0.0) * 1000
+
+    def _on_pause_prop(self, value):
+        self._cached_pause = bool(value)
+
     def _get_duration_ms(self):
-        try:
-            d = self.player.duration
-            return (d or 0.0) * 1000
-        except Exception:
-            return 0.0
+        return self._cached_duration_ms
 
     def _get_time_ms(self):
         try:
@@ -1968,14 +2224,23 @@ class VideoPlayer:
         if self.is_seeking:
             dur_ms = self._get_duration_ms()
             if dur_ms > 0:
+                # ドラッグ中はキーフレーム単位の軽いシークに留め、カクつきを防ぐ。
+                # 正確な位置への着地は指を離した瞬間（_on_seek_release）で行う。
                 try:
                     self.player.seek(float(val) / 1000 * dur_ms / 1000,
-                                     reference="absolute", precision="exact")
+                                     reference="absolute", precision="keyframes")
                 except Exception:
                     pass
 
     def _on_seek_release(self, _event):
         self.is_seeking = False
+        dur_ms = self._get_duration_ms()
+        if dur_ms > 0:
+            try:
+                self.player.seek(self.seek_var.get() / 1000 * dur_ms / 1000,
+                                 reference="absolute", precision="exact")
+            except Exception:
+                pass
 
     def _on_seekbar_motion(self, event):
         if not self._current_path or not FFMPEG:
@@ -2042,12 +2307,7 @@ class VideoPlayer:
         self._lbtn_prev      = False
         self._our_pid        = os.getpid()
         self._click_time     = 0.0
-        self._click_after_id = None
         self._poll_video_click()
-
-    def _fire_single_click(self):
-        self._click_after_id = None
-        self.toggle_play()
 
     def _ask_file(self, fn, *args, **kwargs):
         """filedialogのラッパー。開いている間だけ_native_dialog_openを立てて
@@ -2127,19 +2387,16 @@ class VideoPlayer:
                     cw = self.video_canvas.winfo_width()
                     ch = self.video_canvas.winfo_height()
                     if cx <= px <= cx + cw and cy <= py <= cy + ch:
+                        # シングルクリックでの一時停止は廃止（全画面移行のダブルクリック
+                        # 判定と競合し、切替時にpauseが挟まって滑らかさを損なうため）。
+                        # 動画エリアはダブルクリックでの全画面切替のみを担当する。
+                        # 一時停止はスペースキーまたは操作バーの▶ボタンで行う。
                         now = time.time()
                         if now - self._click_time < 0.35:
-                            if self._click_after_id:
-                                self.root.after_cancel(self._click_after_id)
-                                self._click_after_id = None
                             self._click_time = 0.0
                             self.toggle_fullscreen()
                         else:
                             self._click_time = now
-                            if self._click_after_id:
-                                self.root.after_cancel(self._click_after_id)
-                            self._click_after_id = self.root.after(
-                                350, self._fire_single_click)
                 self._lbtn_prev = is_down
         except Exception:
             pass
@@ -2158,6 +2415,9 @@ class VideoPlayer:
         self.root.bind("<Up>",      lambda e: self._vol_step(5))
         self.root.bind("<Down>",    lambda e: self._vol_step(-5))
         self.root.bind("m",         lambda e: self.toggle_mute())
+        self.root.bind("t",         lambda e: self._toggle_always_on_top())
+        self.root.bind("<Control-Right>", lambda e: self._play_next())
+        self.root.bind("<Control-Left>",  lambda e: self._play_prev())
         self.root.bind("i",         lambda e: self.player.command("script-binding", "stats/display-stats-toggle"))
         self.root.bind("I",         lambda e: self.player.command("script-binding", "stats/display-stats-toggle"))
         self.root.bind_all("<MouseWheel>", self._on_mousewheel)
@@ -2209,7 +2469,8 @@ class VideoPlayer:
             self._rt_btn.config(text="⚡ リアルタイム自動調整: ON", fg=COL_GRN)
             self._auto_btn.config(text="⚡ AUTO", fg=COL_GRN)
             self._auto_adj_status.set("ベースライン解析中...")
-            threading.Thread(target=self._rt_loop, daemon=True).start()
+            self._rt_thread = threading.Thread(target=self._rt_loop, daemon=True)
+            self._rt_thread.start()
 
     def _rt_establish_baseline(self, path, duration_sec):
         # 32点サンプル（均等分布 + 前後端）で正常フレームをより多く確保
@@ -2268,7 +2529,7 @@ class VideoPlayer:
             pos_ms = self._get_time_ms()
             bl     = self._rt_baseline
             if path and pos_ms >= 0 and bl:
-                stats = analyze_frame(path, max(0.0, pos_ms / 1000.0))
+                stats = analyze_current_frame(self.player)
                 if stats and not self._rt_stop.is_set():
                     cur_mean = stats["lum_mean"]
                     cur_std  = stats["lum_std"]
@@ -2390,11 +2651,7 @@ class VideoPlayer:
             self.dur_var.set(td)
             self._time_btn_var.set(f"{tc} / {td}")
 
-        try:
-            paused = self.player.pause
-            is_playing = (paused is False)
-        except Exception:
-            is_playing = False
+        is_playing = (self._cached_pause is False)
         new_icon = "⏸" if is_playing else "▶"
         if self.play_btn.cget("text") != new_icon:
             self.play_btn.config(text=new_icon)
