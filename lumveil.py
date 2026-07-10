@@ -21,6 +21,7 @@ SEEK_SEC       = 5
 PREV_W, PREV_H = 192, 108
 CACHE_MAX      = 30
 SNAP_STEP      = 2
+AMF_FRC_MAX_FPS = 50.0  # 元動画がこれを超えるfpsならAMD AMFフレーム補間を自動バイパス
 FFMPEG         = shutil.which("ffmpeg")
 
 _SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
@@ -102,6 +103,7 @@ COL_DIM  = "#aaaaaa"
 COL_BLU  = "#4fc3f7"
 COL_YEL  = "#ffcc02"
 COL_GRN  = "#00b050"
+SETTING_LABEL_W = 18
 
 
 # ── ツールチップ ─────────────────────────────────────────────────────────
@@ -254,10 +256,11 @@ class VideoPlayer:
         self._gpu_sigmoid     = False
         self._gpu_correct_ds  = False
         self._gpu_interpolate = True
-        self._gpu_hwdec       = "auto-safe"
+        self._gpu_hwdec       = "no"  # 初回起動時は安全側のオフを既定にする
         self._gpu_dither      = "fruit"
         self._gpu_tonemapping = "auto"
         self._gpu_deinterlace = False
+        self._gpu_amf_frc     = False  # AMD AMF専用のGPUハードウェアフレーム補間
         self._gpu_glsl        = []   # list of absolute shader paths
         self._load_gpu_settings()
 
@@ -280,6 +283,11 @@ class VideoPlayer:
         self._always_on_top = False
         self._playlist      = []
         self._playlist_idx  = -1
+        # 再生設定（初期値は従来の挙動を維持）
+        self._playback_eof_action = "next"   # next / stop
+        self._resume_enabled      = True
+        self._folder_end_action   = "stop"   # stop / loop
+        self._playlist_sort       = "name"   # name / modified
         self._ab_state      = 0   # 0=未設定 1=A地点設定済み 2=ループ中
         self.fps           = 30.0
         self.is_seeking    = False
@@ -287,6 +295,20 @@ class VideoPlayer:
         self._speed        = 1.0
         self._muted        = False
         self._lbtn_prev    = False
+        # 右側の操作バーは、よく使う項目だけを常時表示できる。
+        # どの項目も「…」メニューから実行できるため、非表示にしても機能は失われない。
+        self._toolbar_default_visible = {
+            "speed", "subtitles", "audio", "screenshot", "bookmark",
+            "auto_adjust", "fullscreen",
+        }
+        self._toolbar_visible = set(self._toolbar_default_visible)
+        self._toolbar_order = [
+            "fullscreen", "auto_adjust", "speed", "subtitles", "audio",
+            "screenshot", "bookmark", "pin", "recent", "ab_repeat", "gpu", "about",
+        ]
+        self._toolbar_items = {}
+        self._toolbar_auto_hidden = set()
+        self._toolbar_resize_after = None
 
         self._build_ui()
         self.root.update()  # canvas を確実に実体化してから winfo_id を取得
@@ -298,7 +320,7 @@ class VideoPlayer:
             keep_open_pause=False,
             loglevel="error",
             vo="gpu",
-            hwdec="auto-safe",
+            hwdec="no",
         )
         if sys.platform == "win32":
             mpv_kwargs["gpu_api"] = "d3d11"
@@ -389,9 +411,25 @@ class VideoPlayer:
             self._recent_files = data.get("recent_files", [])
             self._resume_positions = data.get("resume_positions", {})
             self._always_on_top = bool(data.get("always_on_top", False))
+            self._playback_eof_action = data.get("playback_eof_action", "next")
+            self._resume_enabled = bool(data.get("resume_enabled", True))
+            self._folder_end_action = data.get("folder_end_action", "stop")
+            self._playlist_sort = data.get("playlist_sort", "name")
+            saved_toolbar = data.get("toolbar_visible")
+            if isinstance(saved_toolbar, list):
+                valid = set(self._toolbar_item_definitions())
+                self._toolbar_visible = set(saved_toolbar) & valid
+            saved_order = data.get("toolbar_order")
+            if isinstance(saved_order, list):
+                valid = set(self._toolbar_order)
+                ordered = [key for key in saved_order if key in valid]
+                self._toolbar_order = ordered + [key for key in self._toolbar_order
+                                                 if key not in ordered]
             if self._always_on_top:
                 self.root.attributes("-topmost", True)
                 self._pin_btn.config(fg=COL_GRN)
+            if self._toolbar_items:
+                self._refresh_toolbar()
         except Exception:
             pass
 
@@ -404,6 +442,12 @@ class VideoPlayer:
                     "recent_files": self._recent_files,
                     "resume_positions": self._resume_positions,
                     "always_on_top": self._always_on_top,
+                    "toolbar_visible": sorted(self._toolbar_visible),
+                    "toolbar_order": self._toolbar_order,
+                    "playback_eof_action": self._playback_eof_action,
+                    "resume_enabled": self._resume_enabled,
+                    "folder_end_action": self._folder_end_action,
+                    "playlist_sort": self._playlist_sort,
                 }, f, ensure_ascii=False)
         except Exception:
             pass
@@ -421,6 +465,10 @@ class VideoPlayer:
     def _update_resume_position(self):
         path = self._current_path
         if not path:
+            return
+        if not self._resume_enabled:
+            self._resume_positions.pop(path, None)
+            self._save_player_settings()
             return
         pos_ms = self._get_time_ms()
         dur_ms = self._get_duration_ms()
@@ -444,11 +492,11 @@ class VideoPlayer:
         self._save_player_settings()
 
     def _on_mpv_file_loaded(self, _event):
-        """ファイルロード後に画像調整値とノイズ設定を再適用し、続きの位置へシーク"""
+        """ファイルロード後に画像調整値・ノイズ設定・AMFフレーム補間を再適用し、続きの位置へシーク"""
         self.root.after(200, self._apply_all_adj)
-        if self._denoise:
-            self.root.after(300, lambda: self.player.command("vf", "set", "hqdn3d"))
-        resume_sec = self._resume_positions.get(self._current_path)
+        if self._denoise or self._gpu_amf_frc:
+            self.root.after(300, self._apply_vf_chain)
+        resume_sec = self._resume_positions.get(self._current_path) if self._resume_enabled else None
         if resume_sec:
             self.root.after(200, lambda s=resume_sec: self._resume_seek(s))
 
@@ -567,6 +615,7 @@ class VideoPlayer:
 
         btn_row = tk.Frame(self.ctrl_bar, bg=BG_CTRL)
         btn_row.pack(fill=tk.X, padx=6, pady=(0, 6))
+        self._btn_row = btn_row
 
         f, _ = self._fixed_btn(btn_row, "⊕", self.open_file, w=30,
                                font=("Segoe UI", 10), tooltip="ファイルを開く")
@@ -597,20 +646,14 @@ class VideoPlayer:
 
         self._sep(btn_row)
 
-        _mf, self._mute_btn = self._fixed_btn(btn_row, "🔊", self.toggle_mute,
+        _mf, self._mute_btn = self._fixed_btn(btn_row, "🔊", self._toggle_volume_popup,
                                               w=32, font=("Segoe UI", 12),
-                                              tooltip="ミュート切替")
+                                              tooltip="音量（右クリックでミュート）")
         _mf.pack(side=tk.LEFT)
+        self._mute_btn.bind("<Button-3>", lambda _e: self.toggle_mute())
+        self._volume_popup = None
 
         self.vol_var = tk.IntVar(value=80)
-        vol_sc = tk.Scale(btn_row, from_=0, to=100, orient=tk.HORIZONTAL,
-                          variable=self.vol_var, command=self._on_volume,
-                          length=90, showvalue=False,
-                          bg="#ffffff", troughcolor="#555555",
-                          activebackground="#dddddd",
-                          highlightthickness=1, highlightbackground="#ffffff",
-                          bd=0, sliderlength=14, sliderrelief=tk.RAISED)
-        vol_sc.pack(side=tk.LEFT, padx=(2, 6))
         self._vol_pending = False
 
         self._time_btn_var = tk.StringVar(value="0:00:00 / 0:00:00")
@@ -618,75 +661,66 @@ class VideoPlayer:
                  bg=BG_CTRL, fg=COL_DIM,
                  font=("Consolas", 9)).pack(side=tk.LEFT, padx=4)
 
-        right = tk.Frame(btn_row, bg=BG_CTRL)
-        right.pack(side=tk.RIGHT)
+        self._toolbar_right = tk.Frame(btn_row, bg=BG_CTRL)
+        self._toolbar_right.pack(side=tk.RIGHT)
+        btn_row.bind("<Configure>", self._on_toolbar_resize)
+        right = self._toolbar_right
 
         f, self._fs_btn = self._fixed_btn(right, "⛶", self.toggle_fullscreen,
-                                          w=30, font=("Segoe UI", 12),
-                                          tooltip="全画面表示")
-        f.pack(side=tk.RIGHT, padx=1)
-
+                                          w=30, font=("Segoe UI", 12), tooltip="全画面表示")
+        self._toolbar_items["fullscreen"] = f
         f, self._pin_btn = self._fixed_btn(right, "📌", self._toggle_always_on_top,
-                                           w=30, font=("Segoe UI", 11),
-                                           tooltip="常に手前に表示 (T)")
-        f.pack(side=tk.RIGHT, padx=1)
-
-        f, _ = self._fixed_btn(right, "ⓘ", self._show_about,
-                               w=24, font=("Segoe UI", 9), tooltip="Lumveilについて")
-        f.pack(side=tk.RIGHT, padx=(4, 1))
-
+                                           w=30, font=("Segoe UI", 11), tooltip="常に手前に表示 (T)")
+        self._toolbar_items["pin"] = f
+        f, _ = self._fixed_btn(right, "ⓘ", self._show_about, w=24,
+                               font=("Segoe UI", 9), tooltip="Lumveilについて")
+        self._toolbar_items["about"] = f
         f, self._auto_btn = self._fixed_btn(right, "⚡ AUTO", self._toggle_rt_adj,
-                                            w=66, font=("Segoe UI", 9),
-                                            tooltip="暗闇補正(自動)のON/OFF")
-        f.pack(side=tk.RIGHT, padx=1)
-
-        f, _ = self._fixed_btn(right, "🎛", self._toggle_adj_win,
-                               w=30, font=("Segoe UI", 11), tooltip="設定")
-        f.pack(side=tk.RIGHT, padx=1)
-
-        f, _ = self._fixed_btn(right, "⚙ GPU", self._toggle_gpu_win,
-                               w=54, font=("Segoe UI", 9), tooltip="GPU/シェーダー設定")
-        f.pack(side=tk.RIGHT, padx=1)
-
-        f, _ = self._fixed_btn(right, "🕘", self._show_recent_menu,
-                               w=30, font=("Segoe UI", 11), tooltip="最近開いたファイル")
-        f.pack(side=tk.RIGHT, padx=1)
-
-        f, _ = self._fixed_btn(right, "🎵", lambda: self._show_track_menu("audio"),
-                               w=30, font=("Segoe UI", 11), tooltip="音声トラック")
-        f.pack(side=tk.RIGHT, padx=1)
-
-        f, _ = self._fixed_btn(right, "💬", lambda: self._show_track_menu("sub"),
-                               w=30, font=("Segoe UI", 11), tooltip="字幕トラック")
-        f.pack(side=tk.RIGHT, padx=1)
-
-        f, self._ab_btn = self._fixed_btn(right, "A-B", self._toggle_ab_loop,
-                                          w=34, font=("Segoe UI", 9),
-                                          tooltip="A-Bリピート\nクリックでA地点→B地点→解除")
-        f.pack(side=tk.RIGHT, padx=1)
-
-        f, self._shot_btn = self._fixed_btn(right, "📷", self._take_screenshot,
-                                            w=30, font=("Segoe UI", 11),
-                                            tooltip="スクリーンショット\n(右クリックで保存先設定)")
+                                            w=66, font=("Segoe UI", 9), tooltip="暗闇補正(自動)のON/OFF")
+        self._toolbar_items["auto_adjust"] = f
+        self._settings_btn, self._settings_button = self._fixed_btn(
+            right, "⚙ 設定", self._toggle_adj_win,
+            w=58, font=("Segoe UI", 9), tooltip="設定を開く")
+        f, _ = self._fixed_btn(right, "⚙ GPU", self._toggle_gpu_win, w=54,
+                               font=("Segoe UI", 9), tooltip="GPU/シェーダー設定")
+        self._toolbar_items["gpu"] = f
+        f, _ = self._fixed_btn(right, "🕘", self._show_recent_menu, w=30,
+                               font=("Segoe UI", 11), tooltip="最近開いたファイル")
+        self._toolbar_items["recent"] = f
+        f, _ = self._fixed_btn(right, "🎵", lambda: self._show_track_menu("audio"), w=30,
+                               font=("Segoe UI", 11), tooltip="音声トラック")
+        self._toolbar_items["audio"] = f
+        f, _ = self._fixed_btn(right, "💬", lambda: self._show_track_menu("sub"), w=30,
+                               font=("Segoe UI", 11), tooltip="字幕トラック")
+        self._toolbar_items["subtitles"] = f
+        f, self._ab_btn = self._fixed_btn(right, "A-B", self._toggle_ab_loop, w=34,
+                                          font=("Segoe UI", 9), tooltip="A-Bリピート")
+        self._toolbar_items["ab_repeat"] = f
+        f, self._shot_btn = self._fixed_btn(right, "SS", self._take_screenshot, w=30,
+                                            font=("Consolas", 9, "bold"), tooltip="スクリーンショット")
         self._shot_btn.bind("<Button-3>", self._show_shot_menu)
-        f.pack(side=tk.RIGHT, padx=1)
+        self._toolbar_items["screenshot"] = f
+        f, _ = self._fixed_btn(right, "🔖", self._show_bookmark_menu, w=30,
+                               font=("Segoe UI", 11), tooltip="ブックマーク")
+        self._toolbar_items["bookmark"] = f
 
-        f, _ = self._fixed_btn(right, "🔖", self._show_bookmark_menu,
-                               w=30, font=("Segoe UI", 11), tooltip="ブックマーク")
-        f.pack(side=tk.RIGHT, padx=1)
-
-        self._sep(right)
-
-        spd = tk.Frame(right, bg=BG_CTRL)
-        spd.pack(side=tk.RIGHT)
-        self._btn(spd, "＋", self._speed_up, tooltip="再生速度を上げる",
-                  font=("Segoe UI", 10), pad=(5, 3)).pack(side=tk.RIGHT, padx=1)
+        # 速度は数値ボタンに集約し、クリックで一覧から選ぶ。
+        spd = tk.Frame(right, bg=BG_CTRL, width=50, height=28)
+        spd.pack_propagate(False)
         self._speed_var = tk.StringVar(value="1.00×")
-        tk.Label(spd, textvariable=self._speed_var,
-                 bg=BG_CTRL, fg=COL_BLU,
-                 font=("Consolas", 9), width=5).pack(side=tk.RIGHT)
-        self._btn(spd, "－", self._speed_down, tooltip="再生速度を下げる",
-                  font=("Segoe UI", 10), pad=(5, 3)).pack(side=tk.RIGHT, padx=1)
+        self._speed_btn = tk.Button(spd, textvariable=self._speed_var,
+                                    command=self._show_speed_menu,
+                                    bg=BG_CTRL, fg=COL_BLU, relief=tk.FLAT, bd=0,
+                                    font=("Consolas", 9), cursor="hand2",
+                                    activebackground=BG_BTN_H, activeforeground=COL_TXT)
+        self._speed_btn.pack(fill=tk.BOTH, expand=True)
+        self._add_tooltip(self._speed_btn, "再生速度を選択")
+        self._toolbar_items["speed"] = spd
+
+        self._more_btn = self._btn(right, "⋯", self._show_toolbar_menu,
+                                   tooltip="その他の操作",
+                                   font=("Segoe UI", 14), pad=(7, 1))
+        self._refresh_toolbar()
 
         style = ttk.Style()
         style.theme_use("clam")
@@ -696,6 +730,11 @@ class VideoPlayer:
         style.configure("Adj.Horizontal.TScale",
                         background=BG_ADJ, troughcolor="#333333",
                         sliderlength=12, sliderrelief=tk.FLAT)
+        style.configure("Lumveil.TNotebook", background=BG_ADJ, borderwidth=0)
+        style.configure("Lumveil.TNotebook.Tab", background=BG_BTN, foreground=COL_TXT,
+                        padding=(11, 6), font=("Segoe UI", 10))
+        style.map("Lumveil.TNotebook.Tab",
+                  background=[("selected", BG_BTN_H)], foreground=[("selected", COL_BLU)])
 
         self.prev_popup = tk.Toplevel(self.root)
         self.prev_popup.overrideredirect(True)
@@ -707,6 +746,195 @@ class VideoPlayer:
         self.prev_time_label = tk.Label(self.prev_popup, bg="black", fg="white",
                                         font=("Consolas", 8), pady=2)
         self.prev_time_label.pack()
+
+    # ── 操作バーの表示設定 ────────────────────────────────────────────────
+
+    def _toolbar_item_definitions(self):
+        """ID: （メニュー表示名、実行関数）。すべて「…」から利用できる。"""
+        return {
+            "fullscreen":  ("全画面表示", self.toggle_fullscreen),
+            "pin":         ("常に手前に表示", self._toggle_always_on_top),
+            "about":       ("Lumveilについて", self._show_about),
+            "auto_adjust": ("暗闇補正（AUTO）", self._toggle_rt_adj),
+            "settings":    ("設定", self._toggle_adj_win),
+            "gpu":         ("GPU / シェーダー設定", self._toggle_gpu_win),
+            "recent":      ("最近開いたファイル", self._show_recent_menu),
+            "audio":       ("音声トラック", lambda: self._show_track_menu("audio")),
+            "subtitles":   ("字幕トラック", lambda: self._show_track_menu("sub")),
+            "ab_repeat":   ("A-Bリピート", self._toggle_ab_loop),
+            "screenshot":  ("スクリーンショットを保存", self._take_screenshot),
+            "bookmark":    ("ブックマーク", self._show_bookmark_menu),
+            "speed":       ("再生速度を選択", self._show_speed_menu),
+        }
+
+    def _refresh_toolbar(self):
+        if not self._toolbar_items:
+            return
+        for frame in self._toolbar_items.values():
+            frame.pack_forget()
+        self._more_btn.pack_forget()
+        # side=RIGHT のため、表示順の逆から詰めて左→右の順序を保つ。
+        self._settings_btn.pack_forget()
+        self._more_btn.pack(side=tk.RIGHT, padx=(4, 1))
+        self._settings_btn.pack(side=tk.RIGHT, padx=1)
+        for key in reversed(self._toolbar_order):
+            if key in self._toolbar_visible and key not in self._toolbar_auto_hidden:
+                self._toolbar_items[key].pack(side=tk.RIGHT, padx=1)
+        self.root.after_idle(self._update_toolbar_overflow)
+
+    def _on_toolbar_resize(self, _event=None):
+        """連続するリサイズイベントをまとめて、操作項目の退避を再計算する。"""
+        if self._toolbar_resize_after:
+            self.root.after_cancel(self._toolbar_resize_after)
+        self._toolbar_resize_after = self.root.after(40, self._update_toolbar_overflow)
+
+    def _update_toolbar_overflow(self):
+        self._toolbar_resize_after = None
+        if not hasattr(self, "_btn_row") or not hasattr(self, "_settings_btn"):
+            return
+        self._btn_row.update_idletasks()
+        left_width = sum(
+            child.winfo_width() for child in self._btn_row.winfo_children()
+            if child is not self._toolbar_right
+        )
+        available = max(0, self._btn_row.winfo_width() - left_width - 8)
+        fixed_width = self._settings_btn.winfo_reqwidth() + self._more_btn.winfo_reqwidth() + 8
+        visible_keys = [key for key in self._toolbar_order if key in self._toolbar_visible]
+        remaining = fixed_width + sum(self._toolbar_items[key].winfo_reqwidth() + 2
+                                      for key in visible_keys)
+        hidden = set()
+        # 設定された表示順の右側から、必要な分だけメニューへ一時退避する。
+        for key in reversed(self._toolbar_order):
+            if key in self._toolbar_visible and remaining > available:
+                hidden.add(key)
+                remaining -= self._toolbar_items[key].winfo_reqwidth() + 2
+        if hidden != self._toolbar_auto_hidden:
+            self._toolbar_auto_hidden = hidden
+            self._refresh_toolbar()
+
+    def _set_toolbar_item_visible(self, key, var):
+        if var.get():
+            self._toolbar_visible.add(key)
+        else:
+            self._toolbar_visible.discard(key)
+        self._refresh_toolbar()
+        self._refresh_toolbar_settings()
+        self._save_player_settings()
+
+    def _show_toolbar_settings(self):
+        self._settings_tabs.select(self._toolbar_tab)
+        if not self._settings_win.winfo_viewable():
+            x = self.root.winfo_rootx() + 20
+            y = self.root.winfo_rooty() + 40
+            self._settings_win.geometry(f"+{x}+{y}")
+            self._settings_win.deiconify()
+        self._settings_win.lift()
+
+    def _refresh_toolbar_settings(self):
+        if not hasattr(self, "_toolbar_preview"):
+            return
+        for child in self._toolbar_preview.winfo_children():
+            child.destroy()
+        self._toolbar_preview_items = {}
+        for key in self._toolbar_order:
+            if key in self._toolbar_visible:
+                icon = self._toolbar_icons[key]
+                item = tk.Label(self._toolbar_preview, text=icon, bg=BG_BTN, fg=COL_TXT,
+                                font=("Segoe UI", 11), padx=7, pady=4, cursor="fleur")
+                item.pack(side=tk.LEFT, padx=1)
+                item.bind("<ButtonPress-1>", lambda e, k=key: self._toolbar_preview_drag_start(e, k))
+                item.bind("<B1-Motion>", self._toolbar_preview_drag_motion)
+                item.bind("<ButtonRelease-1>", self._toolbar_drag_end)
+                self._toolbar_preview_items[key] = item
+        # side=RIGHT は先にpackしたものが最右端になる。
+        tk.Label(self._toolbar_preview, text="⋯", bg="#2a2a2a", fg=COL_TXT,
+                 font=("Segoe UI", 13), padx=7, pady=2).pack(side=tk.RIGHT, padx=1)
+        tk.Label(self._toolbar_preview, text="⚙ 設定", bg="#2a2a2a", fg=COL_TXT,
+                 font=("Segoe UI", 9), padx=7, pady=5).pack(side=tk.RIGHT, padx=1)
+
+        for key, row in getattr(self, "_toolbar_rows", {}).items():
+            active = key == getattr(self, "_toolbar_drag_target", None)
+            row.config(bg="#2a4a6a" if active else BG_ADJ)
+            for child in row.winfo_children():
+                if isinstance(child, tk.Label):
+                    child.config(bg="#2a4a6a" if active else BG_ADJ)
+
+    def _toolbar_drag_start(self, event, key):
+        self._toolbar_drag_key = key
+        self._toolbar_drag_target = key
+        self._refresh_toolbar_settings()
+
+    def _toolbar_preview_drag_start(self, _event, key):
+        self._toolbar_drag_key = key
+        self._toolbar_drag_target = key
+
+    def _toolbar_preview_drag_motion(self, event):
+        if not getattr(self, "_toolbar_drag_key", None):
+            return
+        visible = [key for key in self._toolbar_order if key in self._toolbar_preview_items]
+        target = None  # 最後の項目より右なら末尾へ追加する。
+        for key in visible:
+            item = self._toolbar_preview_items[key]
+            if event.x_root < item.winfo_rootx() + item.winfo_width() // 2:
+                target = key
+                break
+        self._toolbar_drag_target = target
+
+    def _toolbar_drag_motion(self, event):
+        if not getattr(self, "_toolbar_drag_key", None):
+            return
+        y = event.y_root
+        target = self._toolbar_drag_key
+        for key in self._toolbar_order:
+            row = self._toolbar_rows[key]
+            if y < row.winfo_rooty() + row.winfo_height() // 2:
+                target = key
+                break
+        self._toolbar_drag_target = target
+        self._refresh_toolbar_settings()
+
+    def _toolbar_drag_end(self, _event):
+        key = getattr(self, "_toolbar_drag_key", None)
+        target = getattr(self, "_toolbar_drag_target", None)
+        self._toolbar_drag_key = None
+        self._toolbar_drag_target = None
+        if key and target is None:
+            self._toolbar_order.remove(key)
+            self._toolbar_order.append(key)
+            self._refresh_toolbar()
+            self._save_player_settings()
+            self._build_toolbar_settings_tab()
+            self._settings_tabs.select(self._toolbar_tab)
+        elif key and target and key != target:
+            self._toolbar_order.remove(key)
+            self._toolbar_order.insert(self._toolbar_order.index(target), key)
+            self._refresh_toolbar()
+            self._save_player_settings()
+            self._build_toolbar_settings_tab()
+            self._settings_tabs.select(self._toolbar_tab)
+        else:
+            self._refresh_toolbar_settings()
+
+    def _show_toolbar_menu(self):
+        menu = tk.Menu(self.root, tearoff=False, bg=BG_ADJ, fg=COL_TXT,
+                       activebackground=BG_BTN_H, activeforeground=COL_TXT,
+                       font=("Segoe UI", 9))
+        definitions = self._toolbar_item_definitions()
+        for key in ("fullscreen", "pin", "auto_adjust", "settings", "gpu", "recent",
+                    "subtitles", "audio", "ab_repeat", "screenshot", "bookmark", "about"):
+            label, command = definitions[key]
+            menu.add_command(label=label, command=command)
+        menu.add_separator()
+        menu.add_command(label="再生速度を選択…", command=self._show_speed_menu)
+        menu.add_command(label="スクリーンショットの保存先…", command=self._show_shot_menu)
+        menu.add_separator()
+
+        menu.add_command(label="操作バーを設定…", command=self._show_toolbar_settings)
+        try:
+            menu.tk_popup(self._more_btn.winfo_rootx(),
+                          self._more_btn.winfo_rooty() + self._more_btn.winfo_height())
+        finally:
+            menu.grab_release()
 
     # ── 最近開いたファイル ──────────────────────────────────────────────
 
@@ -876,6 +1104,10 @@ class VideoPlayer:
         if d:
             self._shot_dir = d
             self._save_player_settings()
+            if hasattr(self, "_toolbar_tab"):
+                self._build_toolbar_settings_tab()
+                if self._settings_win.winfo_viewable():
+                    self._settings_tabs.select(self._toolbar_tab)
 
     def _show_shot_menu(self, event=None):
         win = tk.Toplevel(self.root)
@@ -975,11 +1207,11 @@ class VideoPlayer:
         tk.Label(win, text="Lumveil",
                  bg=BG_ADJ, fg=COL_BLU,
                  font=("Segoe UI", 20, "bold")).pack(pady=(24, 4))
-        tk.Label(win, text="ver. 1.4",
+        tk.Label(win, text="ver. 1.5",
                  bg=BG_ADJ, fg=COL_DIM,
                  font=("Segoe UI", 9)).pack()
         tk.Frame(win, bg="#333333", height=1).pack(fill=tk.X, padx=30, pady=14)
-        tk.Label(win, text="ふぁん × Claude Code",
+        tk.Label(win, text="ふぁん",
                  bg=BG_ADJ, fg=COL_TXT,
                  font=("Segoe UI", 9)).pack()
         self._btn(win, "閉じる", win.destroy,
@@ -987,23 +1219,36 @@ class VideoPlayer:
 
     # ── 画像調整ウィンドウ ─────────────────────────────────────────────────
 
-    def _build_adj_win(self):
-        win = tk.Toplevel(self.root)
-        win.title("設定")
-        win.configure(bg=BG_ADJ)
-        win.resizable(False, False)
-        win.withdraw()
-        win.protocol("WM_DELETE_WINDOW", win.withdraw)
-        self._adj_win = win
+    def _add_settings_tab_intro(self, parent, title, description):
+        """全設定タブで共通の見出しと短い説明を表示する。"""
+        head = tk.Frame(parent, bg=BG_ADJ)
+        head.pack(fill=tk.X, padx=16, pady=(12, 6))
+        tk.Label(head, text=title, bg=BG_ADJ, fg=COL_TXT,
+                 font=("Segoe UI", 12, "bold")).pack(anchor="w")
+        tk.Label(head, text=description, bg=BG_ADJ, fg=COL_DIM,
+                 font=("Segoe UI", 9)).pack(anchor="w", pady=(2, 0))
+        tk.Frame(parent, bg="#333333", height=1).pack(fill=tk.X, padx=12, pady=(0, 4))
 
-        tk.Label(win, text="設定", bg=BG_ADJ, fg=COL_TXT,
-                 font=("Segoe UI", 11, "bold"), pady=10).pack()
-        tk.Frame(win, bg="#333333", height=1).pack(fill=tk.X, padx=12)
+    def _build_adj_win(self):
+        self._settings_win = tk.Toplevel(self.root)
+        self._settings_win.title("設定")
+        self._settings_win.configure(bg=BG_ADJ)
+        self._settings_win.resizable(True, True)
+        self._settings_win.minsize(520, 420)
+        self._settings_win.withdraw()
+        self._settings_win.protocol("WM_DELETE_WINDOW", self._settings_win.withdraw)
+        self._adj_win = self._settings_win
+        self._settings_tabs = ttk.Notebook(self._settings_win, style="Lumveil.TNotebook")
+        self._settings_tabs.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        win = tk.Frame(self._settings_tabs, bg=BG_ADJ)
+        self._picture_tab = win
+        self._settings_tabs.add(win, text="画質")
+        self._add_settings_tab_intro(win, "画質", "明るさ・色味・字幕と音声の見た目を調整します。")
 
         mode_row = tk.Frame(win, bg=BG_ADJ)
         mode_row.pack(fill=tk.X, padx=16, pady=(8, 4))
         tk.Label(mode_row, text="映像モード:", bg=BG_ADJ, fg=COL_TXT,
-                 font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(0, 6))
+                 font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(0, 6))
         for mname in PICTURE_MODES:
             b = self._btn(mode_row, mname, lambda m=mname: self._apply_picture_mode(m),
                          bg=BG_ADJ, pad=(8, 3))
@@ -1016,8 +1261,8 @@ class VideoPlayer:
         for key, label, lo, hi, default in ADJ_PARAMS:
             row = tk.Frame(win, bg=BG_ADJ)
             row.pack(fill=tk.X, padx=16, pady=4)
-            tk.Label(row, text=f"{label}:", width=11, anchor="w",
-                     bg=BG_ADJ, fg=COL_TXT, font=("Segoe UI", 9)).pack(side=tk.LEFT)
+            tk.Label(row, text=f"{label}:", width=SETTING_LABEL_W, anchor="w",
+                     bg=BG_ADJ, fg=COL_TXT, font=("Segoe UI", 10)).pack(side=tk.LEFT)
             var = tk.DoubleVar(value=default)
             self._adj_vars[key] = (var, default)
             sc = ttk.Scale(row, from_=lo, to=hi, orient=tk.HORIZONTAL, variable=var,
@@ -1037,8 +1282,8 @@ class VideoPlayer:
 
         tr = tk.Frame(win, bg=BG_ADJ)
         tr.pack(fill=tk.X, padx=16, pady=4)
-        tk.Label(tr, text="暗闇補正の閾値:", width=13, anchor="w",
-                 bg=BG_ADJ, fg=COL_YEL, font=("Segoe UI", 9)).pack(side=tk.LEFT)
+        tk.Label(tr, text="暗闇補正の閾値:", width=SETTING_LABEL_W, anchor="w",
+                 bg=BG_ADJ, fg=COL_YEL, font=("Segoe UI", 10)).pack(side=tk.LEFT)
         self._thresh_var = tk.DoubleVar(value=self._dark_thresh)
         ts = ttk.Scale(tr, from_=0.0, to=1.0, orient=tk.HORIZONTAL,
                        variable=self._thresh_var, length=200,
@@ -1062,16 +1307,18 @@ class VideoPlayer:
         # ON/OFFと強度のみを提供する（自動検出はしない）。
         hr = tk.Frame(win, bg=BG_ADJ)
         hr.pack(fill=tk.X, padx=16, pady=4)
-        tk.Label(hr, text="白飛び補正:", width=11, anchor="w",
-                 bg=BG_ADJ, fg=COL_YEL, font=("Segoe UI", 9)).pack(side=tk.LEFT)
+        tk.Label(hr, text="白飛び補正:", width=SETTING_LABEL_W, anchor="w",
+                 bg=BG_ADJ, fg=COL_YEL, font=("Segoe UI", 10)).pack(side=tk.LEFT)
         self._hl_btn = self._btn(hr, "ハイライト圧縮シェーダー: OFF",
                                  self._toggle_hl_shader, bg=BG_ADJ, pad=(8, 3))
         self._hl_btn.pack(side=tk.LEFT, padx=6)
 
         hs = tk.Frame(win, bg=BG_ADJ)
         hs.pack(fill=tk.X, padx=16, pady=4)
-        tk.Label(hs, text="強度:", width=11, anchor="w",
-                 bg=BG_ADJ, fg=COL_YEL, font=("Segoe UI", 9)).pack(side=tk.LEFT)
+        hs_label = tk.Label(hs, text="強度:", width=SETTING_LABEL_W, anchor="w",
+                            bg=BG_ADJ, fg=COL_YEL, font=("Segoe UI", 10))
+        hs_label.pack(side=tk.LEFT)
+        _ToolTip(hs_label, "白飛びした明部を抑えます。")
         self._hl_strength_var = tk.DoubleVar(value=0.5)
         hss = ttk.Scale(hs, from_=0.0, to=1.0, orient=tk.HORIZONTAL,
                         variable=self._hl_strength_var, length=200,
@@ -1084,8 +1331,6 @@ class VideoPlayer:
                  bg=BG_ADJ, fg=COL_YEL, font=("Consolas", 9)).pack(side=tk.LEFT)
         self._hl_strength_var.trace_add("write",
             lambda *_: hsd.set(f"{self._hl_strength_var.get():.2f}"))
-        tk.Label(hs, text="本当にクリップした明部だけに効く。全体が眠い時はγを直接下げる",
-                 bg=BG_ADJ, fg=COL_DIM, font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=6)
 
         tk.Frame(win, bg="#333333", height=1).pack(fill=tk.X, padx=12, pady=(4, 2))
 
@@ -1117,14 +1362,15 @@ class VideoPlayer:
                  font=("Segoe UI", 8), pady=6).pack()
 
     def _toggle_adj_win(self):
-        if self._adj_win.winfo_viewable():
-            self._adj_win.withdraw()
+        self._settings_tabs.select(self._picture_tab)
+        if self._settings_win.winfo_viewable():
+            self._settings_win.withdraw()
         else:
             x = self.root.winfo_rootx() + 20
             y = self.root.winfo_rooty() + 40
-            self._adj_win.geometry(f"+{x}+{y}")
-            self._adj_win.deiconify()
-            self._adj_win.lift()
+            self._settings_win.geometry(f"+{x}+{y}")
+            self._settings_win.deiconify()
+            self._settings_win.lift()
 
     # ── 字幕/音声の同期・見た目調整 ────────────────────────────────────────
 
@@ -1132,8 +1378,8 @@ class VideoPlayer:
         def _sync_row(label, lo, hi, default, unit, mpv_prop, fmt="{:+.1f}"):
             row = tk.Frame(win, bg=BG_ADJ)
             row.pack(fill=tk.X, padx=16, pady=4)
-            tk.Label(row, text=f"{label}:", width=11, anchor="w",
-                     bg=BG_ADJ, fg=COL_TXT, font=("Segoe UI", 9)).pack(side=tk.LEFT)
+            tk.Label(row, text=f"{label}:", width=SETTING_LABEL_W, anchor="w",
+                     bg=BG_ADJ, fg=COL_TXT, font=("Segoe UI", 10)).pack(side=tk.LEFT)
             var = tk.DoubleVar(value=default)
 
             def _apply(_=None, var=var, prop=mpv_prop):
@@ -1178,9 +1424,9 @@ class VideoPlayer:
         ("lanczos",  "Lanczos   （高品質）"),
     ]
     _HWDEC_OPTIONS = [
-        ("auto-safe", "自動（安全）"),
-        ("auto",      "自動（全て試行）"),
-        ("no",        "無効（ソフトウェア）"),
+        ("auto-safe", "オン（推奨）"),
+        ("auto",      "オン（強制・実験的）"),
+        ("no",        "オフ（CPUで処理）"),
     ]
     _DITHER_OPTIONS = [
         ("fruit",   "fruit  （高品質・デフォルト）"),
@@ -1197,17 +1443,21 @@ class VideoPlayer:
     ]
 
     def _build_gpu_win(self):
-        win = tk.Toplevel(self.root)
-        win.title("GPU / シェーダー設定")
-        win.configure(bg=BG_ADJ)
-        win.resizable(False, False)
-        win.withdraw()
-        win.protocol("WM_DELETE_WINDOW", win.withdraw)
-        self._gpu_win = win
-
-        tk.Label(win, text="GPU / シェーダー設定", bg=BG_ADJ, fg=COL_TXT,
-                 font=("Segoe UI", 11, "bold"), pady=10).pack()
-        tk.Frame(win, bg="#333333", height=1).pack(fill=tk.X, padx=12)
+        # 画質タブと同じ設定ウィンドウ内に、用途別の詳細タブを追加する。
+        self._smooth_tab = tk.Frame(self._settings_tabs, bg=BG_ADJ)
+        self._decode_tab = tk.Frame(self._settings_tabs, bg=BG_ADJ)
+        self._shader_tab = tk.Frame(self._settings_tabs, bg=BG_ADJ)
+        self._output_tab = tk.Frame(self._settings_tabs, bg=BG_ADJ)
+        self._settings_tabs.add(self._smooth_tab, text="なめらかさ")
+        self._settings_tabs.add(self._decode_tab, text="GPU再生支援")
+        self._settings_tabs.add(self._shader_tab, text="シェーダー")
+        self._settings_tabs.add(self._output_tab, text="映像出力")
+        self._add_settings_tab_intro(self._smooth_tab, "なめらかさ", "再生の滑らかさとフレーム補間を設定します。")
+        self._add_settings_tab_intro(self._decode_tab, "GPU再生支援", "GPUを使って動画を再生するための設定です。")
+        self._add_settings_tab_intro(self._shader_tab, "シェーダー", "映像の拡大・補正・外部シェーダーを設定します。")
+        self._add_settings_tab_intro(self._output_tab, "映像出力", "HDR変換や表示時の画質処理を設定します。")
+        self._gpu_win = self._settings_win
+        win = self._shader_tab
 
         _TIPS = {
             "スケール":
@@ -1235,11 +1485,21 @@ class VideoPlayer:
                 "フレーム間に中間フレームを生成し、再生をなめらかにします。\n"
                 "速度変更時（0.75x・1.25x等）のカクカク感を軽減します。\n"
                 "video-sync=display-resample + interpolation=yes を適用。",
-            "ハードウェアデコード":
-                "GPUでデコードし CPU 負荷を軽減します。\n"
-                "自動（安全）: 実績あるデコーダのみ使用（推奨）\n"
-                "自動（全て）: 対応していれば全て試行\n"
-                "無効: ソフトウェアデコード（互換性最高）\n"
+            "AMD AMFフレーム補間":
+                "AMD GPU内蔵の専用ハードウェアで、動きを解析して本物の中間\n"
+                "フレームを生成します（フレームレートを約2倍に）。上の「フレーム\n"
+                "補間」より高品質ですが、AMD GPU + GPU再生支援（オン）が必要です。\n"
+                "非対応環境では自動的に無効のまま動作します（fallback指定）。\n"
+                f"※ 元動画が{AMF_FRC_MAX_FPS:.0f}fpsを超える場合は、GPU使用率が\n"
+                "跳ね上がりドロップの原因になるため自動的にスキップされます。\n"
+                "※「フレーム補間」「ノイズ軽減」とは同時使用できないため、\n"
+                "どちらかをONにすると自動的にもう片方はOFFになります。",
+            "GPU再生支援":
+                "GPUでデコードしCPU負荷を軽減します（従来のハードウェアデコード）。\n"
+                "オン（推奨）: 実績あるデコーダのみ使用\n"
+                "オン（強制・実験的）: 対応していれば全て試行（不安定な場合あり）\n"
+                "オフ: ソフトウェアデコード（互換性最高・初期状態）\n"
+                "※ AMD AMFフレーム補間を使うにはオンが必須です。\n"
                 "※ 変更は次のファイルから有効",
             "GLSLシェーダー":
                 "外部シェーダーファイル（.glsl）を適用します。\n"
@@ -1262,8 +1522,8 @@ class VideoPlayer:
         def _row(label):
             r = tk.Frame(win, bg=BG_ADJ)
             r.pack(fill=tk.X, padx=16, pady=5)
-            lbl = tk.Label(r, text=f"{label}:", width=16, anchor="w",
-                           bg=BG_ADJ, fg=COL_TXT, font=("Segoe UI", 9))
+            lbl = tk.Label(r, text=f"{label}:", width=SETTING_LABEL_W, anchor="w",
+                           bg=BG_ADJ, fg=COL_TXT, font=("Segoe UI", 10))
             lbl.pack(side=tk.LEFT)
             if label in _TIPS:
                 _ToolTip(lbl, _TIPS[label])
@@ -1281,7 +1541,7 @@ class VideoPlayer:
                            command=self._on_gpu_scale)
         om.config(bg=BG_ADJ, fg=COL_TXT, activebackground=BG_BTN_H,
                   activeforeground=COL_TXT, highlightthickness=0,
-                  relief=tk.FLAT, font=("Segoe UI", 9), width=22)
+                  relief=tk.FLAT, font=("Segoe UI", 10), width=22)
         om["menu"].config(bg=BG_ADJ, fg=COL_TXT,
                           activebackground=BG_BTN_H, activeforeground=COL_TXT)
         om.pack(side=tk.LEFT)
@@ -1297,7 +1557,7 @@ class VideoPlayer:
                             command=self._on_gpu_cscale)
         com.config(bg=BG_ADJ, fg=COL_TXT, activebackground=BG_BTN_H,
                    activeforeground=COL_TXT, highlightthickness=0,
-                   relief=tk.FLAT, font=("Segoe UI", 9), width=22)
+                   relief=tk.FLAT, font=("Segoe UI", 10), width=22)
         com["menu"].config(bg=BG_ADJ, fg=COL_TXT,
                            activebackground=BG_BTN_H, activeforeground=COL_TXT)
         com.pack(side=tk.LEFT)
@@ -1309,7 +1569,7 @@ class VideoPlayer:
             r, text="ON" if self._gpu_deband else "OFF", command=self._on_gpu_deband,
             bg=BG_ADJ, fg=COL_GRN if self._gpu_deband else COL_TXT,
             relief=tk.FLAT, bd=0,
-            font=("Segoe UI", 9), padx=10, pady=3, cursor="hand2",
+            font=("Segoe UI", 10), width=8, padx=6, pady=3, cursor="hand2",
             activebackground=BG_BTN_H, activeforeground=COL_TXT)
         self._deband_btn.pack(side=tk.LEFT)
 
@@ -1335,7 +1595,7 @@ class VideoPlayer:
             command=self._on_gpu_sigmoid,
             bg=BG_ADJ, fg=COL_GRN if self._gpu_sigmoid else COL_TXT,
             relief=tk.FLAT, bd=0,
-            font=("Segoe UI", 9), padx=10, pady=3, cursor="hand2",
+            font=("Segoe UI", 10), width=8, padx=6, pady=3, cursor="hand2",
             activebackground=BG_BTN_H, activeforeground=COL_TXT)
         self._sigmoid_btn.pack(side=tk.LEFT)
 
@@ -1346,9 +1606,12 @@ class VideoPlayer:
             command=self._on_gpu_correct_ds,
             bg=BG_ADJ, fg=COL_GRN if self._gpu_correct_ds else COL_TXT,
             relief=tk.FLAT, bd=0,
-            font=("Segoe UI", 9), padx=10, pady=3, cursor="hand2",
+            font=("Segoe UI", 10), width=8, padx=6, pady=3, cursor="hand2",
             activebackground=BG_BTN_H, activeforeground=COL_TXT)
         self._correct_ds_btn.pack(side=tk.LEFT)
+
+        # なめらかさ
+        win = self._smooth_tab
 
         # フレーム補間
         r = _row("フレーム補間")
@@ -1357,10 +1620,23 @@ class VideoPlayer:
             command=self._on_gpu_interpolate,
             bg=BG_ADJ, fg=COL_GRN if self._gpu_interpolate else COL_TXT,
             relief=tk.FLAT, bd=0,
-            font=("Segoe UI", 9), padx=10, pady=3, cursor="hand2",
+            font=("Segoe UI", 10), width=8, padx=6, pady=3, cursor="hand2",
             activebackground=BG_BTN_H, activeforeground=COL_TXT)
         self._interpolate_btn.pack(side=tk.LEFT)
 
+        # AMD AMFフレーム補間（GPUハードウェアによる動き補償型の実補間）
+        r = _row("AMD AMF補間")
+        self._amf_frc_btn = tk.Button(
+            r, text="ON" if self._gpu_amf_frc else "OFF",
+            command=self._on_gpu_amf_frc,
+            bg=BG_ADJ, fg=COL_GRN if self._gpu_amf_frc else COL_TXT,
+            relief=tk.FLAT, bd=0,
+            font=("Segoe UI", 10), width=8, padx=6, pady=3, cursor="hand2",
+            activebackground=BG_BTN_H, activeforeground=COL_TXT)
+        self._amf_frc_btn.pack(side=tk.LEFT)
+
+        # シェーダー
+        win = self._shader_tab
         tk.Frame(win, bg="#333333", height=1).pack(fill=tk.X, padx=12, pady=(6, 2))
 
         # Anime4Kプリセット
@@ -1376,7 +1652,7 @@ class VideoPlayer:
         tk.Frame(win, bg="#333333", height=1).pack(fill=tk.X, padx=12, pady=(4, 2))
 
         # GLSLシェーダー
-        r = _row("GLSLシェーダー（詳細・手動）")
+        r = _row("GLSLシェーダー")
         self._btn(r, "＋ 追加", self._on_gpu_glsl_add,
                   bg=BG_ADJ, pad=(8, 3)).pack(side=tk.LEFT)
         self._btn(r, "選択削除", self._on_gpu_glsl_remove,
@@ -1400,8 +1676,9 @@ class VideoPlayer:
 
         tk.Frame(win, bg="#333333", height=1).pack(fill=tk.X, padx=12, pady=(2, 2))
 
-        # ハードウェアデコード
-        r = _row("ハードウェアデコード")
+        # GPU再生支援（従来のハードウェアデコード）
+        win = self._decode_tab
+        r = _row("GPU再生支援")
         self._gpu_hwdec_var = tk.StringVar()
         cur_hw_lbl = next(lbl for val, lbl in self._HWDEC_OPTIONS
                           if val == self._gpu_hwdec)
@@ -1411,12 +1688,15 @@ class VideoPlayer:
                             command=self._on_gpu_hwdec)
         hom.config(bg=BG_ADJ, fg=COL_TXT, activebackground=BG_BTN_H,
                    activeforeground=COL_TXT, highlightthickness=0,
-                   relief=tk.FLAT, font=("Segoe UI", 9), width=22)
+                   relief=tk.FLAT, font=("Segoe UI", 10), width=22)
         hom["menu"].config(bg=BG_ADJ, fg=COL_TXT,
                            activebackground=BG_BTN_H, activeforeground=COL_TXT)
         hom.pack(side=tk.LEFT)
 
         tk.Frame(win, bg="#333333", height=1).pack(fill=tk.X, padx=12, pady=(4, 2))
+
+        # 映像出力
+        win = self._output_tab
 
         # ディザリング
         r = _row("ディザリング")
@@ -1429,7 +1709,7 @@ class VideoPlayer:
                              command=self._on_gpu_dither)
         dtom.config(bg=BG_ADJ, fg=COL_TXT, activebackground=BG_BTN_H,
                     activeforeground=COL_TXT, highlightthickness=0,
-                    relief=tk.FLAT, font=("Segoe UI", 9), width=22)
+                    relief=tk.FLAT, font=("Segoe UI", 10), width=22)
         dtom["menu"].config(bg=BG_ADJ, fg=COL_TXT,
                             activebackground=BG_BTN_H, activeforeground=COL_TXT)
         dtom.pack(side=tk.LEFT)
@@ -1445,7 +1725,7 @@ class VideoPlayer:
                              command=self._on_gpu_tonemap)
         tmom.config(bg=BG_ADJ, fg=COL_TXT, activebackground=BG_BTN_H,
                     activeforeground=COL_TXT, highlightthickness=0,
-                    relief=tk.FLAT, font=("Segoe UI", 9), width=22)
+                    relief=tk.FLAT, font=("Segoe UI", 10), width=22)
         tmom["menu"].config(bg=BG_ADJ, fg=COL_TXT,
                             activebackground=BG_BTN_H, activeforeground=COL_TXT)
         tmom.pack(side=tk.LEFT)
@@ -1457,7 +1737,7 @@ class VideoPlayer:
             command=self._on_gpu_deinterlace,
             bg=BG_ADJ, fg=COL_GRN if self._gpu_deinterlace else COL_TXT,
             relief=tk.FLAT, bd=0,
-            font=("Segoe UI", 9), padx=10, pady=3, cursor="hand2",
+            font=("Segoe UI", 10), width=8, padx=6, pady=3, cursor="hand2",
             activebackground=BG_BTN_H, activeforeground=COL_TXT)
         self._deinterlace_btn.pack(side=tk.LEFT)
 
@@ -1472,16 +1752,142 @@ class VideoPlayer:
         tk.Label(win, textvariable=self._gpu_status,
                  bg=BG_ADJ, fg=COL_GRN,
                  font=("Segoe UI", 8), pady=6).pack()
+        self._build_playback_settings_tab()
+        self._build_toolbar_settings_tab()
+
+    def _build_playback_settings_tab(self):
+        tab = tk.Frame(self._settings_tabs, bg=BG_ADJ)
+        self._playback_tab = tab
+        self._settings_tabs.add(tab, text="再生")
+        self._add_settings_tab_intro(tab, "再生", "動画の終了時・再開位置・フォルダ再生の動作を設定します。")
+
+        def option_row(label, variable, options, command):
+            row = tk.Frame(tab, bg=BG_ADJ)
+            row.pack(fill=tk.X, padx=16, pady=6)
+            tk.Label(row, text=f"{label}:", width=SETTING_LABEL_W, anchor="w",
+                     bg=BG_ADJ, fg=COL_TXT, font=("Segoe UI", 10)).pack(side=tk.LEFT)
+            menu = tk.OptionMenu(row, variable, *options, command=command)
+            menu.config(bg=BG_ADJ, fg=COL_TXT, activebackground=BG_BTN_H,
+                        activeforeground=COL_TXT, highlightthickness=0,
+                        relief=tk.FLAT, font=("Segoe UI", 10), width=22)
+            menu["menu"].config(bg=BG_ADJ, fg=COL_TXT,
+                                activebackground=BG_BTN_H, activeforeground=COL_TXT)
+            menu.pack(side=tk.LEFT)
+
+        self._eof_var = tk.StringVar(value="次の動画を再生" if self._playback_eof_action == "next" else "停止")
+        option_row("再生終了時", self._eof_var, ("停止", "次の動画を再生"), self._on_eof_setting)
+
+        row = tk.Frame(tab, bg=BG_ADJ)
+        row.pack(fill=tk.X, padx=16, pady=6)
+        tk.Label(row, text="前回位置から再開:", width=SETTING_LABEL_W, anchor="w",
+                 bg=BG_ADJ, fg=COL_TXT, font=("Segoe UI", 10)).pack(side=tk.LEFT)
+        self._resume_btn = tk.Button(row, text="ON" if self._resume_enabled else "OFF",
+                                     command=self._toggle_resume_enabled,
+                                     bg=BG_ADJ, fg=COL_GRN if self._resume_enabled else COL_TXT,
+                                     relief=tk.FLAT, bd=0, font=("Segoe UI", 10), width=8,
+                                     padx=6, pady=3, cursor="hand2",
+                                     activebackground=BG_BTN_H, activeforeground=COL_TXT)
+        self._resume_btn.pack(side=tk.LEFT)
+
+        self._end_var = tk.StringVar(value="先頭へ戻る" if self._folder_end_action == "loop" else "停止")
+        option_row("フォルダ末尾", self._end_var, ("停止", "先頭へ戻る"), self._on_folder_end_setting)
+
+        self._sort_var = tk.StringVar(value="更新日時順" if self._playlist_sort == "modified" else "ファイル名順")
+        option_row("次の動画の並び", self._sort_var, ("ファイル名順", "更新日時順"), self._on_playlist_sort_setting)
+
+    def _on_eof_setting(self, value):
+        self._playback_eof_action = "next" if value == "次の動画を再生" else "stop"
+        self._save_player_settings()
+
+    def _toggle_resume_enabled(self):
+        self._resume_enabled = not self._resume_enabled
+        self._resume_btn.config(text="ON" if self._resume_enabled else "OFF",
+                                fg=COL_GRN if self._resume_enabled else COL_TXT)
+        if not self._resume_enabled:
+            self._resume_positions.clear()
+        self._save_player_settings()
+
+    def _on_folder_end_setting(self, value):
+        self._folder_end_action = "loop" if value == "先頭へ戻る" else "stop"
+        self._save_player_settings()
+
+    def _on_playlist_sort_setting(self, value):
+        self._playlist_sort = "modified" if value == "更新日時順" else "name"
+        if self._current_path:
+            self._build_folder_playlist(self._current_path)
+        self._save_player_settings()
+
+    def _build_toolbar_settings_tab(self):
+        """常時表示の切替と並び順を、実物に近いプレビューで設定する。"""
+        if hasattr(self, "_toolbar_tab"):
+            self._settings_tabs.forget(self._toolbar_tab)
+            self._toolbar_tab.destroy()
+        tab = tk.Frame(self._settings_tabs, bg=BG_ADJ)
+        self._toolbar_tab = tab
+        self._settings_tabs.add(tab, text="操作バー")
+        self._toolbar_icons = {
+            "fullscreen": "⛶", "pin": "📌", "about": "ⓘ", "auto_adjust": "⚡",
+            "gpu": "⚙ GPU", "recent": "🕘", "audio": "🎵", "subtitles": "💬",
+            "ab_repeat": "A-B", "screenshot": "📷", "bookmark": "🔖", "speed": "1.00×",
+        }
+        tk.Label(tab, text="操作バー", bg=BG_ADJ, fg=COL_TXT,
+                 font=("Segoe UI", 12, "bold")).pack(anchor="w", padx=16, pady=(12, 2))
+        tk.Label(tab, text="チェックで常時表示を切り替え、⠿ をドラッグして並び順を変えます。",
+                 bg=BG_ADJ, fg=COL_DIM, font=("Segoe UI", 9)).pack(anchor="w", padx=16)
+        tk.Label(tab, text="プレビュー", bg=BG_ADJ, fg=COL_BLU,
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=16, pady=(12, 3))
+        self._toolbar_preview = tk.Frame(tab, bg="#080808", bd=1, relief=tk.SOLID)
+        self._toolbar_preview.pack(fill=tk.X, padx=16)
+
+        tk.Label(tab, text="常時表示する項目", bg=BG_ADJ, fg=COL_BLU,
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=16, pady=(14, 4))
+        rows = tk.Frame(tab, bg=BG_ADJ)
+        rows.pack(fill=tk.X, padx=16, pady=(0, 12))
+        self._toolbar_rows = {}
+        definitions = self._toolbar_item_definitions()
+        for key in self._toolbar_order:
+            row = tk.Frame(rows, bg=BG_ADJ)
+            row.pack(fill=tk.X, pady=1)
+            self._toolbar_rows[key] = row
+            handle = tk.Label(row, text="⠿", bg=BG_ADJ, fg=COL_DIM,
+                              font=("Segoe UI", 12), cursor="fleur")
+            handle.pack(side=tk.LEFT, padx=(4, 8))
+            handle.bind("<ButtonPress-1>", lambda e, k=key: self._toolbar_drag_start(e, k))
+            handle.bind("<B1-Motion>", self._toolbar_drag_motion)
+            handle.bind("<ButtonRelease-1>", self._toolbar_drag_end)
+            tk.Label(row, text=self._toolbar_icons[key], width=7, anchor="w",
+                     bg=BG_ADJ, fg=COL_TXT, font=("Segoe UI", 10)).pack(side=tk.LEFT)
+            tk.Label(row, text=definitions[key][0], width=24, anchor="w",
+                     bg=BG_ADJ, fg=COL_TXT, font=("Segoe UI", 10)).pack(side=tk.LEFT)
+            var = tk.BooleanVar(value=key in self._toolbar_visible)
+            tk.Checkbutton(row, text="常時表示", variable=var,
+                           command=lambda k=key, v=var: self._set_toolbar_item_visible(k, v),
+                           bg=BG_ADJ, fg=COL_TXT, selectcolor=BG_BTN,
+                           activebackground=BG_ADJ, activeforeground=COL_TXT,
+                           font=("Segoe UI", 10), bd=0, highlightthickness=0).pack(side=tk.RIGHT)
+
+        tk.Frame(tab, bg="#333333", height=1).pack(fill=tk.X, padx=16, pady=(2, 8))
+        shot_box = tk.Frame(tab, bg=BG_ADJ)
+        shot_box.pack(fill=tk.X, padx=16, pady=(0, 12))
+        tk.Label(shot_box, text="スクリーンショットの保存先", anchor="w",
+                 bg=BG_ADJ, fg=COL_TXT, font=("Segoe UI", 10)).pack(fill=tk.X)
+        shot_row = tk.Frame(shot_box, bg=BG_ADJ)
+        shot_row.pack(fill=tk.X, pady=(3, 0))
+        tk.Label(shot_row, text=self._shot_dir, anchor="w", justify=tk.LEFT,
+                 wraplength=340, bg=BG_ADJ, fg=COL_DIM,
+                 font=("Segoe UI", 9)).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        self._btn(shot_row, "変更…", self._change_shot_folder,
+                  bg=BG_ADJ, font=("Segoe UI", 10), pad=(10, 4)).pack(side=tk.RIGHT)
+        self._refresh_toolbar_settings()
 
     def _toggle_gpu_win(self):
-        if self._gpu_win.winfo_viewable():
-            self._gpu_win.withdraw()
-        else:
+        self._settings_tabs.select(self._decode_tab)
+        if not self._settings_win.winfo_viewable():
             x = self.root.winfo_rootx() + 20
             y = self.root.winfo_rooty() + 40
-            self._gpu_win.geometry(f"+{x}+{y}")
-            self._gpu_win.deiconify()
-            self._gpu_win.lift()
+            self._settings_win.geometry(f"+{x}+{y}")
+            self._settings_win.deiconify()
+        self._settings_win.lift()
 
     def _on_gpu_scale(self, lbl):
         val = next(v for v, l in self._SCALE_OPTIONS if l == lbl)
@@ -1549,11 +1955,9 @@ class VideoPlayer:
             self._gpu_status.set(f"⚠ {e}")
         self._save_gpu_settings()
 
-    def _on_gpu_interpolate(self):
-        self._gpu_interpolate = not self._gpu_interpolate
-        on = self._gpu_interpolate
-        self._interpolate_btn.config(text="ON" if on else "OFF",
-                                     fg=COL_GRN if on else COL_TXT)
+    def _set_interpolate_mpv(self, on):
+        """フレーム補間(oversample)のmpvプロパティのみを適用する（ボタン表示や
+        設定保存は呼び出し側の責任）。AMF FRCとの排他制御から共通で使うため分離。"""
         try:
             if on:
                 self.player["video-sync"]    = "display-resample"
@@ -1562,9 +1966,45 @@ class VideoPlayer:
             else:
                 self.player["video-sync"]    = "audio"
                 self.player["interpolation"] = False
-            self._gpu_status.set(f"✓ フレーム補間: {'ON' if on else 'OFF'}")
-        except Exception as e:
-            self._gpu_status.set(f"⚠ {e}")
+        except Exception:
+            pass
+
+    def _on_gpu_interpolate(self):
+        self._gpu_interpolate = not self._gpu_interpolate
+        on = self._gpu_interpolate
+        if on and self._gpu_amf_frc:
+            # フレーム補間とAMD AMFフレーム補間は目的が重複し二重負荷になるため排他化
+            self._gpu_amf_frc = False
+            self._amf_frc_btn.config(text="OFF", fg=COL_TXT)
+            self._apply_vf_chain()
+        self._interpolate_btn.config(text="ON" if on else "OFF",
+                                     fg=COL_GRN if on else COL_TXT)
+        self._set_interpolate_mpv(on)
+        self._gpu_status.set(f"✓ フレーム補間: {'ON' if on else 'OFF'}")
+        self._save_gpu_settings()
+
+    def _on_gpu_amf_frc(self):
+        self._gpu_amf_frc = not self._gpu_amf_frc
+        on = self._gpu_amf_frc
+        if on and self._denoise:
+            # hqdn3d(ソフトウェア)とamf_frc(GPUサーフェス直結)は同時使用不可のため排他化
+            self._denoise = False
+            self._denoise_btn.config(text="🔇 ノイズ軽減: OFF", fg=COL_TXT)
+        if on and self._gpu_interpolate:
+            # フレーム補間とAMD AMFフレーム補間は目的が重複し二重負荷になるため排他化
+            self._gpu_interpolate = False
+            self._interpolate_btn.config(text="OFF", fg=COL_TXT)
+            self._set_interpolate_mpv(False)
+        self._amf_frc_btn.config(text="ON" if on else "OFF",
+                                 fg=COL_GRN if on else COL_TXT)
+        self._apply_vf_chain()
+        if on and self.fps > AMF_FRC_MAX_FPS:
+            self._gpu_status.set(
+                f"⚠ AMD AMFフレーム補間: ON（高フレームレート素材のため自動スキップ中）")
+        else:
+            self._gpu_status.set(
+                f"✓ AMD AMFフレーム補間: {'ON' if on else 'OFF'}"
+                + ("（非AMD環境では自動的に無効のままです）" if on else ""))
         self._save_gpu_settings()
 
     def _apply_anime4k_preset(self, name):
@@ -1655,7 +2095,7 @@ class VideoPlayer:
         self._gpu_hwdec = val
         try:
             self.player["hwdec"] = val
-            self._gpu_status.set(f"✓ hwdec: {val}（次ファイルから有効）")
+            self._gpu_status.set(f"✓ GPU再生支援: {lbl}（次ファイルから有効）")
         except Exception as e:
             self._gpu_status.set(f"⚠ {e}")
         self._save_gpu_settings()
@@ -1701,10 +2141,11 @@ class VideoPlayer:
         self._gpu_sigmoid     = False
         self._gpu_correct_ds  = False
         self._gpu_interpolate = False
-        self._gpu_hwdec       = "auto-safe"
+        self._gpu_hwdec       = "no"
         self._gpu_dither      = "fruit"
         self._gpu_tonemapping = "auto"
         self._gpu_deinterlace = False
+        self._gpu_amf_frc     = False
         self._gpu_glsl        = []
         # UI更新
         cur_lbl = next(lbl for val, lbl in self._SCALE_OPTIONS
@@ -1718,6 +2159,7 @@ class VideoPlayer:
         self._sigmoid_btn.config(text="OFF", fg=COL_TXT)
         self._correct_ds_btn.config(text="OFF", fg=COL_TXT)
         self._interpolate_btn.config(text="OFF", fg=COL_TXT)
+        self._amf_frc_btn.config(text="OFF", fg=COL_TXT)
         self._glsl_listbox.delete(0, tk.END)
         cur_hw_lbl = next(lbl for val, lbl in self._HWDEC_OPTIONS
                           if val == self._gpu_hwdec)
@@ -1744,6 +2186,7 @@ class VideoPlayer:
             self.player["tone-mapping"]        = self._gpu_tonemapping
             self.player["deinterlace"]         = False
             self._apply_glsl_shaders()
+            self._apply_vf_chain()
             self._gpu_status.set("↺ リセット完了")
         except Exception as e:
             self._gpu_status.set(f"⚠ {e}")
@@ -1762,6 +2205,7 @@ class VideoPlayer:
             "dither":      self._gpu_dither,
             "tonemapping": self._gpu_tonemapping,
             "deinterlace": self._gpu_deinterlace,
+            "amf_frc":     self._gpu_amf_frc,
             "glsl":        self._gpu_glsl,
         }
         try:
@@ -1787,6 +2231,7 @@ class VideoPlayer:
             self._gpu_dither      = data.get("dither",      self._gpu_dither)
             self._gpu_tonemapping = data.get("tonemapping", self._gpu_tonemapping)
             self._gpu_deinterlace = data.get("deinterlace", self._gpu_deinterlace)
+            self._gpu_amf_frc     = data.get("amf_frc",     self._gpu_amf_frc)
             self._gpu_glsl        = [p for p in data.get("glsl", [])
                                      if os.path.exists(p)]
         except Exception:
@@ -1811,6 +2256,7 @@ class VideoPlayer:
         except Exception:
             pass
         self._apply_glsl_shaders()
+        self._apply_vf_chain()
 
     # ── スライダークリック修正 ─────────────────────────────────────────────
 
@@ -1824,6 +2270,25 @@ class VideoPlayer:
     # ── 速度 ──────────────────────────────────────────────────────────────
 
     _SPEEDS = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0]
+
+    def _show_speed_menu(self):
+        menu = tk.Menu(self.root, tearoff=False, bg=BG_ADJ, fg=COL_TXT,
+                       activebackground=BG_BTN_H, activeforeground=COL_TXT,
+                       font=("Segoe UI", 10))
+        for rate in self._SPEEDS:
+            label = f"{'✓  ' if abs(rate - self._speed) < 0.01 else '    '}{rate:.2f}×"
+            menu.add_command(label=label, command=lambda r=rate: self._set_speed(r))
+        try:
+            menu.update_idletasks()
+            if self._speed_btn.winfo_ismapped():
+                x = self._speed_btn.winfo_rootx()
+                y = self._speed_btn.winfo_rooty() - menu.winfo_reqheight()
+            else:
+                x = self.root.winfo_pointerx()
+                y = self.root.winfo_pointery()
+            menu.tk_popup(max(0, x), max(0, y))
+        finally:
+            menu.grab_release()
 
     def _set_speed(self, rate):
         self._speed = rate
@@ -1843,6 +2308,62 @@ class VideoPlayer:
 
     # ── 音量 ──────────────────────────────────────────────────────────────
 
+    def _toggle_volume_popup(self):
+        if self._volume_popup and self._volume_popup.winfo_exists():
+            self._volume_popup.destroy()
+            self._volume_popup = None
+            return
+        pop = tk.Toplevel(self.root)
+        self._volume_popup = pop
+        pop.overrideredirect(True)
+        pop.configure(bg=BG_ADJ)
+        pop.attributes("-topmost", True)
+        pop.bind("<FocusOut>", lambda _e: self._close_volume_popup())
+        value = tk.StringVar(value=f"{self.vol_var.get()}%")
+        self._volume_value_label = value
+        self._volume_trace_id = self.vol_var.trace_add("write", self._sync_volume_label)
+        tk.Label(pop, text="音量", bg=BG_ADJ, fg=COL_TXT,
+                 font=("Segoe UI", 8)).pack(padx=10, pady=(8, 0))
+        tk.Label(pop, textvariable=value, bg=BG_ADJ, fg=COL_BLU,
+                 font=("Consolas", 9)).pack(padx=10)
+        scale = tk.Scale(pop, from_=100, to=0, orient=tk.VERTICAL,
+                         variable=self.vol_var, command=self._on_volume,
+                         length=130, showvalue=False, width=12,
+                         bg=BG_ADJ, fg=COL_TXT, troughcolor="#333333",
+                         activebackground=COL_BLU, highlightthickness=0,
+                         bd=0, sliderlength=14, sliderrelief=tk.FLAT)
+        scale.pack(padx=12, pady=(2, 8))
+        scale.bind("<MouseWheel>", self._on_volume_wheel)
+        pop.bind("<MouseWheel>", self._on_volume_wheel)
+        pop.update_idletasks()
+        x = self._mute_btn.winfo_rootx() + self._mute_btn.winfo_width() // 2 - pop.winfo_reqwidth() // 2
+        y = self._mute_btn.winfo_rooty() - pop.winfo_reqheight() - 4
+        pop.geometry(f"+{max(0, x)}+{max(0, y)}")
+        pop.focus_force()
+
+    def _close_volume_popup(self):
+        if hasattr(self, "_volume_trace_id"):
+            try:
+                self.vol_var.trace_remove("write", self._volume_trace_id)
+            except Exception:
+                pass
+            del self._volume_trace_id
+        if self._volume_popup and self._volume_popup.winfo_exists():
+            self._volume_popup.destroy()
+        self._volume_popup = None
+
+    def _sync_volume_label(self, *_args):
+        if hasattr(self, "_volume_value_label"):
+            self._volume_value_label.set(f"{self.vol_var.get()}%")
+
+    def _on_volume_wheel(self, event):
+        """ポップアップ上ではホイール量を明示的に音量へ反映する。"""
+        step = 2 if event.delta > 0 else -2
+        value = max(0, min(100, self.vol_var.get() + step))
+        self.vol_var.set(value)
+        self._on_volume(value)
+        return "break"
+
     def toggle_mute(self):
         self._muted = not self._muted
         try:
@@ -1853,6 +2374,8 @@ class VideoPlayer:
 
     def _on_volume(self, val):
         v = int(float(val))
+        if hasattr(self, "_volume_value_label"):
+            self._volume_value_label.set(f"{v}%")
         if self._muted and v > 0:
             self._muted = False
             self._mute_btn.config(text="🔊")
@@ -2003,13 +2526,48 @@ class VideoPlayer:
 
     # ── ノイズ軽減 ────────────────────────────────────────────────────────
 
+    def _amf_frc_effective(self):
+        """AMF FRCがONでも、元動画が高フレームレート（AMF_FRC_MAX_FPS超）の場合は
+        GPU使用率100%＋大量のフレームドロップにつながるため自動的に適用しない
+        （実測確認済み）。ON設定自体は保持し、動画のfpsに応じて都度判定する。"""
+        return self._gpu_amf_frc and self.fps <= AMF_FRC_MAX_FPS
+
+    def _apply_vf_chain(self):
+        """ノイズ軽減(hqdn3d)はソフトウェア形式のフレームを要求し、AMD AMF
+        フレーム補間(amf_frc)はGPU上のd3d11サーフェスのままである必要がある
+        ため、両者は同時に組み合わせるとフィルタグラフの初期化に失敗する
+        （実測確認済み）。そのため排他的に扱い、常にどちらか一方だけを適用する。
+        AMF FRCを優先する（後からONにした側が勝つよう、両方のトグル側で
+        もう一方を強制OFFにしている）。
+        また、amf_frcが絡む切り替えはAMDのGPUハードウェアコンテキストの
+        再初期化を伴うため、一度チェーンを空にしてから間を置いて次のフィルタを
+        設定することで、切り替え直後の一時的な不安定化を避ける。"""
+        if self._amf_frc_effective():
+            vf_str = "amf_frc=fallback=yes"
+        elif self._denoise:
+            vf_str = "hqdn3d"
+        else:
+            vf_str = ""
+        try:
+            self.player.command("vf", "set", "")
+        except Exception:
+            pass
+
+        def _set_target(target=vf_str):
+            try:
+                self.player.command("vf", "set", target)
+            except Exception:
+                pass
+        self.root.after(50, _set_target)
+
     def _toggle_denoise(self):
         self._denoise = not self._denoise
         on = self._denoise
-        try:
-            self.player.command("vf", "set", "hqdn3d" if on else "")
-        except Exception:
-            pass
+        if on and self._gpu_amf_frc:
+            self._gpu_amf_frc = False
+            self._amf_frc_btn.config(text="OFF", fg=COL_TXT)
+            self._save_gpu_settings()
+        self._apply_vf_chain()
         self._denoise_btn.config(
             text=f"🔇 ノイズ軽減: {'ON' if on else 'OFF'}",
             fg=COL_GRN if on else COL_TXT)
@@ -2081,6 +2639,10 @@ class VideoPlayer:
             return
         files = [os.path.join(folder, f) for f in entries
                  if os.path.splitext(f)[1].lower() in VIDEO_EXTS]
+        if self._playlist_sort == "modified":
+            files.sort(key=lambda p: os.path.getmtime(p))
+        else:
+            files.sort(key=lambda p: os.path.basename(p).lower())
         if path not in files:
             files = [path]
         self._playlist     = files
@@ -2106,8 +2668,13 @@ class VideoPlayer:
         self._play_relative(-1)
 
     def _on_eof_reached(self):
-        if self._playlist and 0 <= self._playlist_idx < len(self._playlist) - 1:
+        if self._playback_eof_action != "next" or not self._playlist:
+            return
+        if 0 <= self._playlist_idx < len(self._playlist) - 1:
             self._play_next()
+        elif self._folder_end_action == "loop":
+            self._playlist_idx = 0
+            self._open_path(self._playlist[0], _from_playlist=True)
 
     # ── A-Bリピート ───────────────────────────────────────────────────────
 
@@ -2150,6 +2717,15 @@ class VideoPlayer:
                 self.fps = fps
         except Exception:
             pass
+        if self._gpu_amf_frc:
+            # 高フレームレート素材かどうかがこの時点で初めて確定するため、
+            # AMF FRCのバイパス判定を動画ごとに再適用する。
+            self._apply_vf_chain()
+            if self.fps > AMF_FRC_MAX_FPS:
+                self._gpu_status.set(
+                    "⚠ AMD AMFフレーム補間: ON（高フレームレート素材のため自動スキップ中）")
+            else:
+                self._gpu_status.set("✓ AMD AMFフレーム補間: ON")
 
     # ── 再生制御 ──────────────────────────────────────────────────────────
 
