@@ -1205,7 +1205,7 @@ class VideoPlayer:
         tk.Label(win, text="Lumveil",
                  bg=BG_ADJ, fg=COL_BLU,
                  font=("Segoe UI", 20, "bold")).pack(pady=(24, 4))
-        tk.Label(win, text="ver. 1.5",
+        tk.Label(win, text="ver. 1.6",
                  bg=BG_ADJ, fg=COL_DIM,
                  font=("Segoe UI", 9)).pack()
         tk.Frame(win, bg="#333333", height=1).pack(fill=tk.X, padx=30, pady=14)
