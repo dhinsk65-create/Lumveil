@@ -12,11 +12,14 @@
 
 vec4 hook() {
     vec4 c = HOOKED_texOff(0);
-    // MPVのコントラストを+100まで適用した出力を入力として、その上がり方を
-    // 延長する。ゲインと正のオフセットを併用し、追加分で画面全体が暗くなる
-    // 以前の固定S字カーブを避ける。
-    float gain = 1.0 + 0.35 * auto_contrast;
-    float lift = 0.08 * auto_contrast;
-    c.rgb = clamp(c.rgb * gain + lift, 0.0, 1.0);
+    // 中間点(pivot)を軸に明暗差を広げる、本来のコントラスト拡張。
+    // AUTOは暗いシーンでのみこのシェーダーを起動するため、pivotは暗部寄りの
+    // 低い値に固定する。0.5等の中間グレーを軸にすると、まだ暗いシーンの
+    // 画素の大半がpivotより下になり、コントラストを上げるほど画面全体が
+    // 黒つぶれする（旧S字カーブと同じ問題）。0.15付近を軸にすることで、
+    // 暗部を潰さずにハイライト側との差を実際に広げられる（実測確認済み）。
+    float factor = 1.0 + 0.5 * auto_contrast;
+    float pivot = 0.15;
+    c.rgb = clamp((c.rgb - pivot) * factor + pivot, 0.0, 1.0);
     return c;
 }

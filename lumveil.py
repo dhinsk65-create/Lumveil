@@ -3138,11 +3138,12 @@ class VideoPlayer:
                         contrast_total = max(-100.0, min(300.0,
                             self._rt_base_adj["contrast"] + contrast_adj))
                         contrast_tgt = contrast_total
-                        # C:+100からγを下げ始め、C:+300で-25に到達させる。
-                        # 強いコントラスト時の白側を締め、全体の陰影を保つ。
-                        gamma_adj = -25.0 * max(0.0, min(1.0,
-                            (contrast_total - 100.0) / 200.0))
-                        gamma_tgt = with_base("gamma", gamma_adj)
+                        # ガンマの自動連動は撤去。実効コントラストのシェーダーを
+                        # 中間点(pivot)基準の計算に修正した結果、以前のように
+                        # コントラストを上げるほど白側だけが伸びる挙動ではなく
+                        # なったため、白側を締めるための補正ガンマは不要かつ
+                        # コントラストの効きを打ち消してしまう（実測確認済み）。
+                        gamma_tgt = with_base("gamma", 0.0)
                         saturation_tgt = with_base("saturation", saturation_adj)
 
                         self._rt_targets.update({
