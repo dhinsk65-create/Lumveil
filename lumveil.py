@@ -885,7 +885,7 @@ class VideoPlayer:
         self._save_player_settings()
 
     def _show_toolbar_settings(self):
-        self._settings_tabs.select(self._toolbar_tab)
+        self._settings_tabs.select(self._advanced_tab)
         if not self._settings_win.winfo_viewable():
             x = self.root.winfo_rootx() + 20
             y = self.root.winfo_rooty() + 40
@@ -967,14 +967,14 @@ class VideoPlayer:
             self._refresh_toolbar()
             self._save_player_settings()
             self._build_toolbar_settings_tab()
-            self._settings_tabs.select(self._toolbar_tab)
+            self._settings_tabs.select(self._advanced_tab)
         elif key and target and key != target:
             self._toolbar_order.remove(key)
             self._toolbar_order.insert(self._toolbar_order.index(target), key)
             self._refresh_toolbar()
             self._save_player_settings()
             self._build_toolbar_settings_tab()
-            self._settings_tabs.select(self._toolbar_tab)
+            self._settings_tabs.select(self._advanced_tab)
         else:
             self._refresh_toolbar_settings()
 
@@ -1273,7 +1273,7 @@ class VideoPlayer:
             if hasattr(self, "_toolbar_tab"):
                 self._build_toolbar_settings_tab()
                 if self._settings_win.winfo_viewable():
-                    self._settings_tabs.select(self._toolbar_tab)
+                    self._settings_tabs.select(self._advanced_tab)
 
     def _show_shot_menu(self, event=None):
         win = tk.Toplevel(self.root)
@@ -1439,33 +1439,15 @@ class VideoPlayer:
         tk.Label(self._settings_win, textvariable=self._settings_status,
                  bg=BG_ADJ, fg=COL_YEL, anchor="w",
                  font=("Segoe UI", 8), padx=12, pady=3).pack(fill=tk.X, side=tk.BOTTOM)
+
+        self._quick_tab = tk.Frame(self._settings_tabs, bg=BG_ADJ)
+        self._settings_tabs.add(self._quick_tab, text="かんたん")
+        self._build_quick_settings(self._quick_tab)
+
         win = tk.Frame(self._settings_tabs, bg=BG_ADJ)
         self._picture_tab = win
-        self._settings_tabs.add(win, text="画質")
-        self._add_settings_tab_intro(win, "画質", "明るさ・色味・字幕と音声の見た目を調整します。")
-
-        quality_row = tk.Frame(win, bg=BG_ADJ)
-        quality_row.pack(fill=tk.X, padx=16, pady=(8, 4))
-        tk.Label(quality_row, text="用途別プリセット:", bg=BG_ADJ, fg=COL_TXT,
-                 font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(0, 6))
-        self._quality_preset_btns = {}
-        quality_tips = {
-            "軽快": "負荷を抑えたいとき。Anime4Kと通常フレーム補間を停止します。",
-            "標準": "普段使い向け。画質と軽快さのバランスを取ります。",
-            "アニメ高画質": "Anime4Kとデバンディングでアニメをきれいに表示します。",
-            "暗所優先": "⚡AUTOを使う準備を整えます。動画を開くまでAUTOは開始しません。",
-        }
-        for pname in QUALITY_PRESETS:
-            b = self._btn(quality_row, pname,
-                          lambda p=pname: self._apply_quality_preset(p),
-                          bg=BG_ADJ, pad=(7, 3), tooltip=quality_tips[pname])
-            b.pack(side=tk.LEFT, padx=2)
-            self._quality_preset_btns[pname] = b
-        self._quality_preset_status = tk.StringVar()
-        tk.Label(win, textvariable=self._quality_preset_status,
-                 bg=BG_ADJ, fg=COL_DIM, font=("Segoe UI", 8)).pack(
-                     anchor="w", padx=16, pady=(0, 2))
-        self._sync_quality_preset_buttons()
+        self._settings_tabs.add(win, text="画質を調整")
+        self._add_settings_tab_intro(win, "画質を調整", "映像の見た目を細かく調整したいときに使います。")
 
         mode_row = tk.Frame(win, bg=BG_ADJ)
         mode_row.pack(fill=tk.X, padx=16, pady=(8, 4))
@@ -1524,32 +1506,10 @@ class VideoPlayer:
 
         tk.Frame(win, bg="#333333", height=1).pack(fill=tk.X, padx=12, pady=(4, 2))
 
-        self._build_sync_controls(win)
-
-        tk.Frame(win, bg="#333333", height=1).pack(fill=tk.X, padx=12, pady=(4, 2))
-
         br = tk.Frame(win, bg=BG_ADJ, pady=8)
         br.pack()
-        self._rt_btn = self._btn(br, "⚡ リアルタイム自動調整: OFF",
-                                 self._toggle_rt_adj, bg=BG_ADJ, pad=(10, 5))
-        self._rt_btn.pack(side=tk.LEFT, padx=5)
         self._btn(br, "↺ すべてリセット", self._reset_all_adj,
                   bg=BG_RED, pad=(10, 5)).pack(side=tk.LEFT, padx=5)
-        self._denoise_btn = self._btn(br, "🔇 ノイズ軽減: OFF",
-                                      self._toggle_denoise, bg=BG_ADJ, pad=(10, 5))
-        self._denoise_btn.pack(side=tk.LEFT, padx=5)
-
-        # AUTO強度モード（4段階セレクタ）
-        rmr = tk.Frame(win, bg=BG_ADJ)
-        rmr.pack(pady=(0, 8))
-        tk.Label(rmr, text="AUTO強度:", bg=BG_ADJ, fg=COL_TXT,
-                 font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(0, 6))
-        for mname in ["OFF"] + list(RT_MODES.keys()):
-            b = self._btn(rmr, mname, lambda m=mname: self._select_rt_mode(m),
-                         bg=BG_ADJ, pad=(8, 3))
-            b.pack(side=tk.LEFT, padx=2)
-            self._rt_mode_btns[mname] = b
-        self._sync_rt_mode_buttons()
 
         # シャドウリフト手動スライダー（AUTO停止中のみ操作可、AUTO稼働中はAUTOが制御）
         sl_row = tk.Frame(win, bg=BG_ADJ)
@@ -1578,13 +1538,54 @@ class VideoPlayer:
         self._btn(br2, "📂 設定を読み込む", self._load_adj,
                   bg=BG_ADJ, pad=(10, 5)).pack(side=tk.LEFT, padx=5)
 
+    def _build_quick_settings(self, win):
+        """初見の利用者が迷わず使える、日常的な設定だけを集約する。"""
+        self._add_settings_tab_intro(win, "かんたん設定", "用途に合わせて選ぶだけで、よく使う設定をまとめて切り替えられます。")
+        quality_row = tk.Frame(win, bg=BG_ADJ)
+        quality_row.pack(fill=tk.X, padx=16, pady=(8, 4))
+        tk.Label(quality_row, text="用途別プリセット:", bg=BG_ADJ, fg=COL_TXT,
+                 font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(0, 6))
+        self._quality_preset_btns = {}
+        quality_tips = {
+            "軽快": "負荷を抑えたいとき。Anime4Kと通常フレーム補間を停止します。",
+            "標準": "普段使い向け。画質と軽快さのバランスを取ります。",
+            "アニメ高画質": "Anime4Kとデバンディングでアニメをきれいに表示します。",
+            "暗所優先": "⚡AUTOを使う準備を整えます。動画を開くまでAUTOは開始しません。",
+        }
+        for pname in QUALITY_PRESETS:
+            b = self._btn(quality_row, pname, lambda p=pname: self._apply_quality_preset(p),
+                          bg=BG_ADJ, pad=(7, 3), tooltip=quality_tips[pname])
+            b.pack(side=tk.LEFT, padx=2)
+            self._quality_preset_btns[pname] = b
+        self._quality_preset_status = tk.StringVar()
+        tk.Label(win, textvariable=self._quality_preset_status, bg=BG_ADJ, fg=COL_DIM,
+                 font=("Segoe UI", 8)).pack(anchor="w", padx=16, pady=(0, 8))
+        self._sync_quality_preset_buttons()
+
+        tk.Frame(win, bg="#333333", height=1).pack(fill=tk.X, padx=12, pady=(2, 6))
+        row = tk.Frame(win, bg=BG_ADJ)
+        row.pack(fill=tk.X, padx=16, pady=4)
+        tk.Label(row, text="暗闇補正:", bg=BG_ADJ, fg=COL_TXT,
+                 font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(0, 6))
+        self._rt_btn = self._btn(row, "⚡ AUTO: OFF", self._toggle_rt_adj,
+                                 bg=BG_ADJ, pad=(10, 5))
+        self._rt_btn.pack(side=tk.LEFT)
+        modes = tk.Frame(win, bg=BG_ADJ)
+        modes.pack(fill=tk.X, padx=16, pady=(2, 8))
+        tk.Label(modes, text="強さ:", bg=BG_ADJ, fg=COL_DIM,
+                 font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(0, 6))
+        for mname in ["OFF"] + list(RT_MODES.keys()):
+            b = self._btn(modes, mname, lambda m=mname: self._select_rt_mode(m),
+                          bg=BG_ADJ, pad=(8, 3))
+            b.pack(side=tk.LEFT, padx=2)
+            self._rt_mode_btns[mname] = b
+        self._sync_rt_mode_buttons()
         self._auto_adj_status = tk.StringVar(value="")
-        tk.Label(win, textvariable=self._auto_adj_status,
-                 bg=BG_ADJ, fg=COL_GRN,
-                 font=("Segoe UI", 8), pady=6).pack()
+        tk.Label(win, textvariable=self._auto_adj_status, bg=BG_ADJ, fg=COL_GRN,
+                 font=("Segoe UI", 8), pady=6).pack(anchor="w", padx=16)
 
     def _toggle_adj_win(self):
-        self._settings_tabs.select(self._picture_tab)
+        self._settings_tabs.select(self._quick_tab)
         if self._settings_win.winfo_viewable():
             self._settings_win.withdraw()
         else:
@@ -1664,20 +1665,45 @@ class VideoPlayer:
         ("clip",     "クリップ（トーンマッピングなし）"),
     ]
 
+    def _add_advanced_section(self, parent, title, description):
+        """詳細設定の項目を必要な時だけ開く折りたたみセクションとして作る。"""
+        outer = tk.Frame(parent, bg=BG_ADJ)
+        outer.pack(fill=tk.X, padx=12, pady=(3, 0))
+        body = tk.Frame(outer, bg=BG_ADJ)
+        visible = tk.BooleanVar(value=False)
+
+        def toggle():
+            if visible.get():
+                body.pack_forget()
+                visible.set(False)
+                button.config(text=f"▶ {title}")
+            else:
+                body.pack(fill=tk.X, pady=(2, 6))
+                visible.set(True)
+                button.config(text=f"▼ {title}")
+
+        button = tk.Button(outer, text=f"▶ {title}", command=toggle,
+                           anchor="w", bg=BG_BTN, fg=COL_TXT, relief=tk.FLAT, bd=0,
+                           activebackground=BG_BTN_H, activeforeground=COL_TXT,
+                           font=("Segoe UI", 10, "bold"), padx=10, pady=6, cursor="hand2")
+        button.pack(fill=tk.X)
+        tk.Label(outer, text=description, bg=BG_ADJ, fg=COL_DIM,
+                 font=("Segoe UI", 8), anchor="w").pack(fill=tk.X, padx=10, pady=(2, 0))
+        return body
+
     def _build_gpu_win(self):
-        # 画質タブと同じ設定ウィンドウ内に、用途別の詳細タブを追加する。
-        self._smooth_tab = tk.Frame(self._settings_tabs, bg=BG_ADJ)
-        self._decode_tab = tk.Frame(self._settings_tabs, bg=BG_ADJ)
-        self._shader_tab = tk.Frame(self._settings_tabs, bg=BG_ADJ)
-        self._output_tab = tk.Frame(self._settings_tabs, bg=BG_ADJ)
-        self._settings_tabs.add(self._smooth_tab, text="なめらかさ")
-        self._settings_tabs.add(self._decode_tab, text="GPU再生支援")
-        self._settings_tabs.add(self._shader_tab, text="シェーダー")
-        self._settings_tabs.add(self._output_tab, text="映像出力")
-        self._add_settings_tab_intro(self._smooth_tab, "なめらかさ", "再生の滑らかさとフレーム補間を設定します。")
-        self._add_settings_tab_intro(self._decode_tab, "GPU再生支援", "GPUを使って動画を再生するための設定です。")
-        self._add_settings_tab_intro(self._shader_tab, "シェーダー", "映像の拡大・補正・外部シェーダーを設定します。")
-        self._add_settings_tab_intro(self._output_tab, "映像出力", "HDR変換や表示時の画質処理を設定します。")
+        # 高度な項目は1タブに集め、必要な項目だけ開ける折りたたみ式にする。
+        self._advanced_tab = tk.Frame(self._settings_tabs, bg=BG_ADJ)
+        self._settings_tabs.add(self._advanced_tab, text="詳細設定")
+        self._add_settings_tab_intro(self._advanced_tab, "詳細設定", "GPU・シェーダーなど、画質を細かく調整したいときに使います。")
+        self._smooth_tab = self._add_advanced_section(
+            self._advanced_tab, "なめらかさ", "フレーム補間・ノイズ軽減")
+        self._decode_tab = self._add_advanced_section(
+            self._advanced_tab, "GPU再生支援", "GPUデコードの設定")
+        self._shader_tab = self._add_advanced_section(
+            self._advanced_tab, "シェーダー", "拡大・Anime4K・外部GLSL")
+        self._output_tab = self._add_advanced_section(
+            self._advanced_tab, "映像出力", "HDR変換・ディザリング・デインターレース")
         self._gpu_win = self._settings_win
         win = self._shader_tab
 
@@ -1856,6 +1882,13 @@ class VideoPlayer:
             font=("Segoe UI", 10), width=8, padx=6, pady=3, cursor="hand2",
             activebackground=BG_BTN_H, activeforeground=COL_TXT)
         self._amf_frc_btn.pack(side=tk.LEFT)
+        r = _row("ノイズ軽減")
+        self._denoise_btn = tk.Button(
+            r, text="🔇 ノイズ軽減: OFF", command=self._toggle_denoise,
+            bg=BG_ADJ, fg=COL_TXT, relief=tk.FLAT, bd=0,
+            font=("Segoe UI", 10), width=16, padx=6, pady=3, cursor="hand2",
+            activebackground=BG_BTN_H, activeforeground=COL_TXT)
+        self._denoise_btn.pack(side=tk.LEFT)
 
         # シェーダー
         win = self._shader_tab
@@ -1980,8 +2013,8 @@ class VideoPlayer:
     def _build_playback_settings_tab(self):
         tab = tk.Frame(self._settings_tabs, bg=BG_ADJ)
         self._playback_tab = tab
-        self._settings_tabs.add(tab, text="再生")
-        self._add_settings_tab_intro(tab, "再生", "動画の終了時・再開位置・フォルダ再生の動作を設定します。")
+        self._settings_tabs.add(tab, text="再生と字幕")
+        self._add_settings_tab_intro(tab, "再生と字幕", "連続再生・再開位置・字幕と音声の同期を設定します。")
 
         def option_row(label, variable, options, command):
             row = tk.Frame(tab, bg=BG_ADJ)
@@ -2016,6 +2049,10 @@ class VideoPlayer:
 
         self._sort_var = tk.StringVar(value="更新日時順" if self._playlist_sort == "modified" else "ファイル名順")
         option_row("次の動画の並び", self._sort_var, ("ファイル名順", "更新日時順"), self._on_playlist_sort_setting)
+        tk.Frame(tab, bg="#333333", height=1).pack(fill=tk.X, padx=12, pady=(8, 4))
+        tk.Label(tab, text="字幕と音声の同期", bg=BG_ADJ, fg=COL_BLU,
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=16, pady=(4, 0))
+        self._build_sync_controls(tab)
 
     def _on_eof_setting(self, value):
         self._playback_eof_action = "next" if value == "次の動画を再生" else "stop"
@@ -2041,12 +2078,13 @@ class VideoPlayer:
 
     def _build_toolbar_settings_tab(self):
         """常時表示の切替と並び順を、実物に近いプレビューで設定する。"""
-        if hasattr(self, "_toolbar_tab"):
-            self._settings_tabs.forget(self._toolbar_tab)
-            self._toolbar_tab.destroy()
-        tab = tk.Frame(self._settings_tabs, bg=BG_ADJ)
+        if hasattr(self, "_toolbar_section"):
+            self._toolbar_section.destroy()
+        self._toolbar_section = tk.Frame(self._advanced_tab, bg=BG_ADJ)
+        self._toolbar_section.pack(fill=tk.X, padx=12, pady=(3, 0))
+        tab = self._add_advanced_section(
+            self._toolbar_section, "操作バー", "表示するボタンと並び順")
         self._toolbar_tab = tab
-        self._settings_tabs.add(tab, text="操作バー")
         self._toolbar_icons = {
             "fullscreen": "⛶", "pin": "📌", "about": "ⓘ", "auto_adjust": "⚡",
             "gpu": "⚙ GPU", "recent": "🕘", "playlist": "☷", "audio": "🎵", "subtitles": "💬",
@@ -2103,7 +2141,7 @@ class VideoPlayer:
         self._refresh_toolbar_settings()
 
     def _toggle_gpu_win(self):
-        self._settings_tabs.select(self._decode_tab)
+        self._settings_tabs.select(self._advanced_tab)
         if not self._settings_win.winfo_viewable():
             x = self.root.winfo_rootx() + 20
             y = self.root.winfo_rooty() + 40
