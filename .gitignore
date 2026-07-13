@@ -1,0 +1,15 @@
+# ビルド生成物
+build/
+dist/
+__pycache__/
+*.pyc
+build_log.txt
+
+# 大容量バイナリ(配布物として別管理)
+ffmpeg.exe
+libmpv-2.dll
+libmpv.dll.a
+
+# ユーザー実行時設定(差分ノイズ防止)
+adj_settings_mpv.json
+gpu_settings_mpv.json

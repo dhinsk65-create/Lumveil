@@ -26,6 +26,7 @@ FFMPEG         = shutil.which("ffmpeg")
 
 _SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 _RT_CONTRAST_SHADER_PATH = os.path.join(_SCRIPT_DIR, "shaders", "lumveil_auto_contrast.glsl")
+_RT_SHADOW_SHADER_PATH  = os.path.join(_SCRIPT_DIR, "shaders", "lumveil_shadow_lift.glsl")
 _SHADER_DIR     = os.path.join(_SCRIPT_DIR, "shaders")
 
 # Anime4K公式プリセット（bloc97/Anime4K のGLSL_Instructions_Advanced.mdに準拠）
@@ -85,6 +86,15 @@ PICTURE_MODES = {
     "鮮やか":   (0, 5, 0, 25),
 }
 
+# AUTO（リアルタイム暗所自動調整）の強度モード
+# 値は (強度倍率, 意図的暗所での残存補正下限)
+RT_MODES = {
+    "控えめ":       (0.4, 0.10),
+    "標準":         (0.6, 0.20),
+    "見やすさ優先": (0.9, 0.35),
+    "極暗":         (0.9, 0.35),
+}
+
 # フォルダ内連続再生・複数ファイルD&D時の対象拡張子（open_fileのフィルタと同一）
 VIDEO_EXTS = {
     ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v",
@@ -103,7 +113,17 @@ COL_DIM  = "#aaaaaa"
 COL_BLU  = "#4fc3f7"
 COL_YEL  = "#ffcc02"
 COL_GRN  = "#00b050"
+COL_PUR  = "#b388ff"
 SETTING_LABEL_W = 18
+
+# AUTO強度モードの表示色(操作バーの⚡AUTOボタンはテキスト固定・色でモードを示す)
+RT_MODE_COLORS = {
+    "OFF":          COL_TXT,
+    "控えめ":       COL_BLU,
+    "標準":         COL_GRN,
+    "見やすさ優先": COL_YEL,
+    "極暗":         COL_PUR,
+}
 
 
 # ── ツールチップ ─────────────────────────────────────────────────────────
@@ -187,17 +207,28 @@ def ffmpeg_thumbnail(path, pos_sec):
     return _ffmpeg_pipe(path, pos_sec, PREV_W, PREV_H)
 
 
-def _frame_stats(img):
+def _frame_stats(img, dark_thresh=60, crush_thresh=25):
     from PIL import ImageStat
     gray = img.convert("L")
     rgb  = img.convert("RGB")
     gs   = ImageStat.Stat(gray)
     cs   = ImageStat.Stat(rgb)
     rm, gm, bm = cs.mean
+    # 暗部率: 輝度<dark_threshの画素の割合。histogram()はCで計算されるためピクセルループより高速。
+    hist = gray.histogram()
+    total = sum(hist)
+    dark_thresh = max(0, min(256, int(dark_thresh)))
+    dark_ratio = (sum(hist[:dark_thresh]) / total) if total else 0.0
+    # 黒潰れ率: 輝度<crush_threshの画素の割合。通常の暗所(輝度30〜90に分布)と
+    # 真の黒潰れ場面を識別するための第3条件。
+    crush_thresh = max(0, min(256, int(crush_thresh)))
+    crush_ratio = (sum(hist[:crush_thresh]) / total) if total else 0.0
     return {
         "lum_mean": gs.mean[0],
         "lum_std":  gs.stddev[0],
         "chroma":   max(rm, gm, bm) - min(rm, gm, bm),
+        "dark_ratio": dark_ratio,
+        "crush_ratio": crush_ratio,
     }
 
 
@@ -210,7 +241,7 @@ def analyze_frame(path, pos_sec):
     return _frame_stats(img)
 
 
-def analyze_current_frame(player):
+def analyze_current_frame(player, dark_thresh=60, crush_thresh=25):
     """リアルタイム補正用: 現在表示中のフレームをmpvから直接取得して解析する。
     ffmpegのプロセス起動・ファイル再オープンが不要になり、AUTO稼働中の
     CPU/ディスク負荷を大幅に減らせる（0.5秒毎にffmpegを起動していたのを廃止）。"""
@@ -219,7 +250,7 @@ def analyze_current_frame(player):
     except Exception:
         return None
     img = img.resize((64, 36))
-    return _frame_stats(img)
+    return _frame_stats(img, dark_thresh=dark_thresh, crush_thresh=crush_thresh)
 
 
 
@@ -238,10 +269,20 @@ class VideoPlayer:
         self._rt_current  = {k: 0.0 for k in ("brightness", "contrast", "gamma", "saturation")}
         # AUTO開始時の手動調整値。暗所補正はこの値を打ち消さず、補正分だけを加算する。
         self._rt_base_adj = {k: 0.0 for k in ("brightness", "contrast", "gamma", "saturation")}
+        # シャドウリフト（0.0〜1.0のGLSL空間、MPV整数4キーとは別管理）
+        self._rt_targets["shadow_lift"] = 0.0
+        self._rt_current["shadow_lift"] = 0.0
         self._rt_baseline = None
         self._rt_thread   = None
         self._dark_thresh = 1.0
         self._pre_rt_adj  = None
+        self._rt_mode     = "標準"
+        # シャドウリフト手動スライダー（0〜100%、AUTO停止中のみ有効）。
+        # _adj_vars（mpvプロパティ直結の4キー）とは別管理。
+        self._manual_shadow_lift = tk.DoubleVar(value=0.0)
+
+        # GLSLシェーダーへ渡すパラメータの一元管理（個別にsetすると互いに上書きし合うため）
+        self._shader_opts = {"auto_contrast": 0.0, "shadow_lift": 0.0}
 
         self._denoise = False
 
@@ -260,6 +301,9 @@ class VideoPlayer:
         self._gpu_amf_frc     = False  # AMD AMF専用のGPUハードウェアフレーム補間
         self._gpu_glsl        = []   # list of absolute shader paths
         self._load_gpu_settings()
+        # AUTO強度モードのみ起動時に自動復元する（スライダー値は手動読込ボタン
+        # 経由でのみ復元する既存挙動を維持）。AUTO自体は自動開始しない。
+        self._load_rt_mode()
 
         self._thumb_cache   = ThumbnailCache()
         self._prev_after_id = None
@@ -274,6 +318,7 @@ class VideoPlayer:
         self._fs_hide_after_id = None
         self._picture_mode = "標準"
         self._mode_btns    = {}
+        self._rt_mode_btns = {}
         self._a4k_btns     = {}
         self._recent_files = []
         self._resume_positions = {}
@@ -673,8 +718,8 @@ class VideoPlayer:
         f, _ = self._fixed_btn(right, "ⓘ", self._show_about, w=24,
                                font=("Segoe UI", 9), tooltip="Lumveilについて")
         self._toolbar_items["about"] = f
-        f, self._auto_btn = self._fixed_btn(right, "⚡ AUTO", self._toggle_rt_adj,
-                                            w=66, font=("Segoe UI", 9), tooltip="暗闇補正(自動)のON/OFF")
+        f, self._auto_btn = self._fixed_btn(right, "⚡ AUTO", self._show_auto_menu,
+                                            w=66, font=("Segoe UI", 9), tooltip="暗闇補正(自動)の強度を選択")
         self._toolbar_items["auto_adjust"] = f
         self._settings_btn, self._settings_button = self._fixed_btn(
             right, "⚙ 設定", self._toggle_adj_win,
@@ -1205,7 +1250,7 @@ class VideoPlayer:
         tk.Label(win, text="Lumveil",
                  bg=BG_ADJ, fg=COL_BLU,
                  font=("Segoe UI", 20, "bold")).pack(pady=(24, 4))
-        tk.Label(win, text="ver. 1.6",
+        tk.Label(win, text="ver. 1.7",
                  bg=BG_ADJ, fg=COL_DIM,
                  font=("Segoe UI", 9)).pack()
         tk.Frame(win, bg="#333333", height=1).pack(fill=tk.X, padx=30, pady=14)
@@ -1314,6 +1359,38 @@ class VideoPlayer:
         self._denoise_btn = self._btn(br, "🔇 ノイズ軽減: OFF",
                                       self._toggle_denoise, bg=BG_ADJ, pad=(10, 5))
         self._denoise_btn.pack(side=tk.LEFT, padx=5)
+
+        # AUTO強度モード（4段階セレクタ）
+        rmr = tk.Frame(win, bg=BG_ADJ)
+        rmr.pack(pady=(0, 8))
+        tk.Label(rmr, text="AUTO強度:", bg=BG_ADJ, fg=COL_TXT,
+                 font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(0, 6))
+        for mname in ["OFF"] + list(RT_MODES.keys()):
+            b = self._btn(rmr, mname, lambda m=mname: self._select_rt_mode(m),
+                         bg=BG_ADJ, pad=(8, 3))
+            b.pack(side=tk.LEFT, padx=2)
+            self._rt_mode_btns[mname] = b
+        self._sync_rt_mode_buttons()
+
+        # シャドウリフト手動スライダー（AUTO停止中のみ操作可、AUTO稼働中はAUTOが制御）
+        sl_row = tk.Frame(win, bg=BG_ADJ)
+        sl_row.pack(fill=tk.X, padx=16, pady=(0, 8))
+        tk.Label(sl_row, text="シャドウリフト:", width=SETTING_LABEL_W, anchor="w",
+                 bg=BG_ADJ, fg=COL_TXT, font=("Segoe UI", 10)).pack(side=tk.LEFT)
+        self._shadow_lift_scale = ttk.Scale(
+            sl_row, from_=0, to=100, orient=tk.HORIZONTAL,
+            variable=self._manual_shadow_lift, length=200,
+            style="Adj.Horizontal.TScale",
+            command=lambda _v: self._on_manual_shadow_lift())
+        self._shadow_lift_scale.pack(side=tk.LEFT, padx=6)
+        self._fix_scale_click(self._shadow_lift_scale, self._manual_shadow_lift, 0, 100)
+        sl_disp = tk.StringVar(value=f"{int(round(self._manual_shadow_lift.get()))}%")
+        tk.Label(sl_row, textvariable=sl_disp, width=5,
+                 bg=BG_ADJ, fg=COL_BLU, font=("Consolas", 9)).pack(side=tk.LEFT)
+        self._manual_shadow_lift.trace_add("write",
+            lambda *_, v=self._manual_shadow_lift, d=sl_disp: d.set(f"{int(round(v.get()))}%"))
+        if self._rt_enabled:
+            self._shadow_lift_scale.config(state=tk.DISABLED)
 
         br2 = tk.Frame(win, bg=BG_ADJ, pady=4)
         br2.pack()
@@ -2030,10 +2107,20 @@ class VideoPlayer:
             self.player.command("change-list", "glsl-shaders", "clr", "")
             for p in self._gpu_glsl:
                 self.player.command("change-list", "glsl-shaders", "append", p)
-            # 追加コントラストは手動でも使えるため、常時読込する（強度0なら無処理）。
+            # 追加コントラスト・シャドウリフトは手動でも使えるため、常時読込する（強度0なら無処理）。
             self.player.command("change-list", "glsl-shaders", "append", _RT_CONTRAST_SHADER_PATH)
+            self.player.command("change-list", "glsl-shaders", "append", _RT_SHADOW_SHADER_PATH)
             if "contrast" in self._adj_vars:
                 self._apply_effective_contrast(self._adj_vars["contrast"][0].get())
+            self._apply_shadow_lift(self._shader_opts.get("shadow_lift", 0.0))
+        except Exception:
+            pass
+
+    def _apply_shader_opts(self):
+        """glsl-shader-optsは一括上書きのため、複数パラメータを一元管理してまとめて適用する。"""
+        try:
+            opts = ",".join(f"{k}={v:.3f}" for k, v in self._shader_opts.items())
+            self.player.command("set", "glsl-shader-opts", opts)
         except Exception:
             pass
 
@@ -2044,10 +2131,22 @@ class VideoPlayer:
         strength = max(0.0, (value - 100.0) / 100.0)
         try:
             self.player["contrast"] = int(round(mpv_value))
-            self.player.command("set", "glsl-shader-opts",
-                                f"auto_contrast={strength:.3f}")
         except Exception:
             pass
+        self._shader_opts["auto_contrast"] = strength
+        self._apply_shader_opts()
+
+    def _apply_shadow_lift(self, value):
+        """0.0〜1.0にクランプしてシャドウリフトシェーダーへ適用する。"""
+        value = max(0.0, min(1.0, float(value)))
+        self._shader_opts["shadow_lift"] = value
+        self._apply_shader_opts()
+
+    def _on_manual_shadow_lift(self):
+        """画質タブのシャドウリフトスライダー操作時に呼ばれる。AUTO稼働中は無視する
+        （スライダー自体もAUTO ON時はdisabledになるが、念のため二重に防ぐ）。"""
+        if not self._rt_enabled:
+            self._apply_shadow_lift(self._manual_shadow_lift.get() / 100.0)
 
     def _on_gpu_hwdec(self, lbl):
         val = next(v for v, l in self._HWDEC_OPTIONS if l == lbl)
@@ -2445,6 +2544,8 @@ class VideoPlayer:
             self._reset_adj(key)
         if self._rt_enabled:
             self._toggle_rt_adj()
+        self._manual_shadow_lift.set(0)
+        self._on_manual_shadow_lift()
 
     def _apply_picture_mode(self, name):
         vals = PICTURE_MODES.get(name)
@@ -2462,8 +2563,27 @@ class VideoPlayer:
         for mname, btn in self._mode_btns.items():
             btn.config(fg=COL_GRN if mname == name else COL_TXT)
 
+    def _load_rt_mode(self):
+        """起動時に adj_settings_mpv.json から rt_mode のみ復元する。
+        スライダー値には触れず、AUTOも自動開始しない。"""
+        if not os.path.exists(ADJ_SETTINGS):
+            return
+        try:
+            with open(ADJ_SETTINGS, encoding="utf-8") as f:
+                data = json.load(f)
+            rt_mode = data.get("rt_mode")
+            if rt_mode in RT_MODES:
+                self._rt_mode = rt_mode
+        except Exception:
+            pass
+        # __init__の早い段階で呼ばれるため、UI(セレクタ)構築前はスキップする。
+        if getattr(self, "_rt_mode_btns", None):
+            self._sync_rt_mode_buttons()
+
     def _save_adj(self):
         data = {k: int(round(v.get())) for k, (v, _) in self._adj_vars.items()}
+        data["rt_mode"] = self._rt_mode
+        data["shadow_lift"] = int(round(self._manual_shadow_lift.get()))
         try:
             with open(ADJ_SETTINGS, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
@@ -2482,6 +2602,16 @@ class VideoPlayer:
                 if k in self._adj_vars:
                     self._adj_vars[k][0].set(int(float(v)))
                     self._on_adjust(k)
+            rt_mode = data.get("rt_mode")
+            if rt_mode in RT_MODES:
+                self._rt_mode = rt_mode
+            else:
+                self._rt_mode = "標準"
+            self._sync_rt_mode_buttons()
+            if "shadow_lift" in data:
+                self._manual_shadow_lift.set(int(float(data["shadow_lift"])))
+                if not self._rt_enabled:
+                    self._on_manual_shadow_lift()
             # 旧形式の「追加コントラスト」は実効コントラストへ移行する。
             if "extra_contrast" in data:
                 base = float(data.get("contrast", 0))
@@ -2981,13 +3111,59 @@ class VideoPlayer:
 
     # ── リアルタイム自動調整 ──────────────────────────────────────────────
 
+    def _select_rt_mode(self, name):
+        """画質タブのAUTO強度4段階セレクタから呼ばれる。"""
+        if name == "OFF":
+            if self._rt_enabled:
+                self._toggle_rt_adj()
+            else:
+                self._sync_rt_mode_buttons()
+            return
+        self._rt_mode = name
+        if not self._rt_enabled:
+            self._toggle_rt_adj()
+        else:
+            # スレッドは毎周期 self._rt_mode を読むため再起動不要。
+            self._sync_rt_mode_buttons()
+
+    def _sync_rt_mode_buttons(self):
+        current = self._rt_mode if self._rt_enabled else "OFF"
+        if self._rt_mode_btns:
+            for mname, btn in self._rt_mode_btns.items():
+                btn.config(fg=COL_GRN if mname == current else COL_TXT)
+        if hasattr(self, "_auto_btn"):
+            # モード名を連結するとボタン幅からはみ出すため、テキストは固定し
+            # 文字色でモードを示す。
+            self._auto_btn.config(text="⚡ AUTO",
+                                  fg=RT_MODE_COLORS.get(current, COL_TXT))
+
+    def _show_auto_menu(self):
+        """⚡AUTOボタンからAUTO強度モードを直接選択するポップアップメニュー。"""
+        menu = tk.Menu(self.root, tearoff=0, bg=BG_CTRL, fg=COL_TXT,
+                        activebackground=BG_BTN_H, activeforeground=COL_TXT)
+        current = self._rt_mode if self._rt_enabled else "OFF"
+        var = tk.StringVar(value=current)
+        for name in ["OFF"] + list(RT_MODES.keys()):
+            # ボタンの文字色とメニュー項目色を揃え、色→モードの対応を覚えやすくする。
+            menu.add_radiobutton(label=name, variable=var, value=name,
+                                  foreground=RT_MODE_COLORS.get(name, COL_TXT),
+                                  command=lambda n=name: self._select_rt_mode(n))
+        menu.update_idletasks()
+        mh = menu.winfo_reqheight()
+        x = self._auto_btn.winfo_rootx()
+        y = self._auto_btn.winfo_rooty() - mh
+        try:
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
     def _toggle_rt_adj(self):
         if self._rt_enabled:
             self._rt_enabled = False
             self._rt_stop.set()
             self._rt_btn.config(text="⚡ リアルタイム自動調整: OFF", fg=COL_TXT)
-            self._auto_btn.config(text="⚡ AUTO", fg=COL_TXT)
             self._auto_adj_status.set("")
+            self._sync_rt_mode_buttons()
             if self._pre_rt_adj:
                 for k, v in self._pre_rt_adj.items():
                     self._adj_vars[k][0].set(v)
@@ -2996,7 +3172,14 @@ class VideoPlayer:
                     except Exception:
                         pass
                 self._pre_rt_adj = None
+            # AUTO停止時はシャドウリフトを0に戻すのではなく、手動スライダーの値を復元する。
+            manual_sl = self._manual_shadow_lift.get() / 100.0
+            self._rt_current["shadow_lift"] = manual_sl
+            self._rt_targets["shadow_lift"] = manual_sl
+            self._apply_shadow_lift(manual_sl)
             self._apply_glsl_shaders()
+            if hasattr(self, "_shadow_lift_scale"):
+                self._shadow_lift_scale.config(state=tk.NORMAL)
         else:
             if not self._current_path or not FFMPEG:
                 self._auto_adj_status.set("⚠ 動画を開いてください（ffmpeg必須）")
@@ -3013,9 +3196,11 @@ class VideoPlayer:
             self._rt_baseline = None
             self._rt_stop.clear()
             self._apply_glsl_shaders()
+            if hasattr(self, "_shadow_lift_scale"):
+                self._shadow_lift_scale.config(state=tk.DISABLED)
             self._rt_btn.config(text="⚡ リアルタイム自動調整: ON", fg=COL_GRN)
-            self._auto_btn.config(text="⚡ AUTO", fg=COL_GRN)
             self._auto_adj_status.set("ベースライン解析中...")
+            self._sync_rt_mode_buttons()
             self._rt_thread = threading.Thread(target=self._rt_loop, daemon=True)
             self._rt_thread.start()
 
@@ -3058,6 +3243,10 @@ class VideoPlayer:
 
         path     = self._current_path
         duration = self._get_duration_ms() / 1000.0
+        # 初回確立を実行できなかった場合(pathなし/duration未確定)は bl_path を None にして
+        # ループ内の再解析ブロックで再試行させる。確立を実行した場合は結果が None でも
+        # bl_path を維持し、明るいフレームが無い動画への無限リトライを防ぐ。
+        bl_path  = path if (path and duration > 0) else None
         if path and duration > 0:
             bl = self._rt_establish_baseline(path, duration)
             if bl and not self._rt_stop.is_set():
@@ -3072,14 +3261,54 @@ class VideoPlayer:
         dark_start_time = None
 
         while self._rt_enabled and not self._rt_stop.is_set():
+            # 動画が切り替わった場合、古い動画のベースラインを新動画に適用し続けないよう
+            # 補正ターゲットを基準値へ戻した上でベースラインを再解析する。
+            if self._current_path != bl_path:
+                self._rt_baseline = None
+                self._rt_targets.update(self._rt_base_adj)
+                self._rt_targets["shadow_lift"] = 0.0
+                self.root.after(0, lambda: self._auto_adj_status.set("ベースライン再解析中..."))
+                new_path = self._current_path
+                new_duration = self._get_duration_ms() / 1000.0
+                if not new_path or new_duration <= 0:
+                    # 動画切替直後は duration が未確定な場合があるため、次周期に持ち越す。
+                    self._rt_stop.wait(0.5)
+                    continue
+                bl = self._rt_establish_baseline(new_path, new_duration)
+                if self._rt_stop.is_set():
+                    break
+                bl_path = new_path
+                dark_start_time = None
+                if bl:
+                    self._rt_baseline = bl
+                    self.root.after(0, lambda b=bl: self._auto_adj_status.set(
+                        f"ベースライン確立  輝度:{b['lum_mean']:.0f}  "
+                        f"コントラスト指標:{b['lum_std']:.0f}"))
+                else:
+                    self.root.after(0, lambda: self._auto_adj_status.set(
+                        "⚠ 明るいフレームが見つかりません"))
+
             path   = self._current_path
             pos_ms = self._get_time_ms()
             bl     = self._rt_baseline
             if path and pos_ms >= 0 and bl:
-                stats = analyze_current_frame(self.player)
+                # screenshot_rawはmpv equalizer適用後の画を返すため、測定値を
+                # ソース空間(ベースラインと同じ空間)へ逆補正する。これを怠ると
+                # 補正量が測定に跳ね返る自己フィードバックで発振する(実測で確認済み)。
+                # mpv実式: out = in*k_c + 2.55*b(実測校正)、chroma_out = chroma*k_s
+                cur_adj = self._rt_current
+                # コントラストの+100超過分はGLSL側でありscreenshot_rawに映らないため、
+                # 逆補正はmpvへ実際に渡る+100までで頭打ちにする。
+                k_c = max(0.01, 1.0 + min(100.0, cur_adj.get("contrast", 0.0)) / 100.0)
+                k_s = max(0.01, 1.0 + cur_adj.get("saturation", 0.0) / 100.0)
+                b_adj = cur_adj.get("brightness", 0.0)
+                dark_thresh = min(255, int(60 * k_c + 2.55 * b_adj))
+
+                stats = analyze_current_frame(self.player, dark_thresh=dark_thresh)
                 if stats and not self._rt_stop.is_set():
-                    cur_mean = stats["lum_mean"]
-                    cur_std  = stats["lum_std"]
+                    cur_mean = max(0.0, (stats["lum_mean"] - 2.55 * b_adj) / k_c)
+                    cur_std  = stats["lum_std"] / k_c
+                    cur_chroma = stats["chroma"] / k_s
                     norm     = cur_mean / 255.0
                     norm_tgt = bl["lum_mean"] / 255.0
                     ratio_mean = cur_mean / max(bl["lum_mean"], 1.0)
@@ -3090,20 +3319,34 @@ class VideoPlayer:
                         (self._dark_thresh - raw_ratio)
                         / max(self._dark_thresh, 0.01)))
 
+                    # 誤検知ガード1: 平均輝度が絶対的・相対的に十分高いなら
+                    # 標準偏差（コントラスト）だけで暗所判定しない
+                    # （霧・白基調・低コントラストな明所シーンの誤判定防止）。
+                    if cur_mean >= 110 or ratio_mean >= 0.60:
+                        dark_factor = 0.0
+
+                    # 誤検知ガード2: 画面の35%以上が暗部画素でなければ暗所補正しない。
+                    if dark_factor >= 0.02 and stats.get("dark_ratio", 1.0) < 0.35:
+                        dark_factor = 0.0
+
                     if dark_factor < 0.02:
                         dark_start_time = None
                         self._rt_targets.update(self._rt_base_adj)
+                        self._rt_targets["shadow_lift"] = 0.0
                         self.root.after(0, lambda rm=ratio_mean, rs=ratio_std:
                             self._auto_adj_status.set(
-                                f"✓ 正常  輝度比:{rm:.2f}  コントラスト比:{rs:.2f}"))
+                                f"✓ 補正なし(十分明るい場面)  輝度比:{rm:.2f}  コントラスト比:{rs:.2f}"))
                     else:
+                        strength, intent_floor = RT_MODES.get(
+                            self._rt_mode, RT_MODES["標準"])
+
                         is_extreme = raw_ratio < EXTREME_RATIO
                         if is_extreme:
                             if dark_start_time is None:
                                 dark_start_time = time.time()
                             elapsed = time.time() - dark_start_time
-                            intent_factor = max(0.6,
-                                1.0 - 0.4 * min(1.0, elapsed / INTENT_SECS))
+                            intent_factor = max(intent_floor,
+                                1.0 - (1.0 - intent_floor) * min(1.0, elapsed / INTENT_SECS))
                         else:
                             dark_start_time = None
                             intent_factor   = 1.0
@@ -3112,23 +3355,45 @@ class VideoPlayer:
 
                         # ── MPV整数空間で直接計算（提案アルゴリズム）────────
                         lum_ratio = norm / max(norm_tgt, 0.001)
-                        # コントラスト: MPV側は+100まで、超過分はGLSLで追加する。
-                        # 実効コントラストを最大+300まで拡張する。+100まではMPV、
-                        # それを超える分は同じ明るさ方向を引き継ぐGLSLで補う。
+
+                        # シャドウリフト（主処理）: 暗部画素だけを構造的に持ち上げる。
+                        # 全域コントラスト拡張と違い中間調・ハイライトを潰さないため、
+                        # AUTOの暗所補正はこれを主とする。
+                        shadow_lift_tgt = min(1.0, dark_factor * intent_factor * 1.2 * strength)
+
+                        # コントラスト（副処理）: シャドウリフトが主処理になったため、
+                        # 全域コントラスト拡張は控えめな補助に縮小する。
+                        # 上限もMPV範囲(+100)内に収まる60までとし、AUTO時はGLSL側の
+                        # コントラスト拡張（100超過分）は実質使われない
+                        # （手動スライダーで+100超を指定した場合のみ使用される）。
+                        # コントラスト係数: シャドウリフト単体で十分改善するとの実映像評価
+                        # を受けて縮小(dark_factor項 40.0→20.0)。
                         std_ratio    = bl["lum_std"] / max(cur_std, 1.0)
-                        contrast_adj = min(300.0, max(0.0,
-                            dark_factor * 180.0 * intent_factor
-                            + (std_ratio - 1.0) * 120.0 * scale))
+                        contrast_adj = min(60.0, max(0.0,
+                            (dark_factor * 20.0 * intent_factor
+                             + (std_ratio - 1.0) * 30.0 * scale) * strength))
 
                         # 輝度: 全体を白側へ寄せやすいので、必要な時だけごく少量に留める。
-                        brightness_adj = min(3.0, max(0.0, 3.0 * scale))
+                        brightness_adj = min(3.0, max(0.0, 3.0 * scale * strength))
+
+                        # 極暗モード(手動選択): 黒潰れ動画向けにユーザー実測レシピ(輝度+33/コントラスト+89
+                        # で黒潰れが視認可)相当を投入する。自動判定は誤発動・発動漏れの両側で破綻したため
+                        # 撤去し、ユーザーが明示的に選ぶ方式にした(局所白飛び検出を手動化したのと同じ判断)。
+                        # 明るい場面まで持ち上げないよう、暗所度に連動させる(dark_factor 0.5以上でフル)。
+                        if self._rt_mode == "極暗":
+                            boost = min(1.0, dark_factor * 2.0) * intent_factor
+                            brightness_adj = min(45.0, brightness_adj + 30.0 * boost)
+                            contrast_adj   = min(95.0, contrast_adj + 80.0 * boost)
 
                         # 彩度: 暗部を持ち上げた時の眠い見え方を補う。
-                        # 元映像より色差が落ちた場合だけ追加分を少し増やす。
-                        chroma_ratio = bl["chroma"] / max(stats["chroma"], 1.0)
-                        saturation_adj = min(60.0, max(0.0,
-                            dark_factor * 20.0 * intent_factor
-                            + max(0.0, chroma_ratio - 1.0) * 32.0 * scale))
+                        # シャドウリフトはコントラスト拡張よりも彩度低下が小さいため、
+                        # 上限・係数とも縮小する。実映像できつすぎたため係数・上限とも半減。
+                        # さらにシャドウリフト単体で十分改善するとの実映像評価を受けて縮小
+                        # (dark_factor項 6.0→3.0、chroma_ratio項 16.0→8.0、上限 24.0→12.0)。
+                        chroma_ratio = bl["chroma"] / max(cur_chroma, 1.0)
+                        saturation_adj = min(12.0, max(0.0,
+                            (dark_factor * 3.0 * intent_factor
+                             + max(0.0, chroma_ratio - 1.0) * 8.0 * scale) * strength))
 
                         def with_base(key, adjustment):
                             return max(-100.0, min(100.0,
@@ -3147,21 +3412,25 @@ class VideoPlayer:
                         saturation_tgt = with_base("saturation", saturation_adj)
 
                         self._rt_targets.update({
-                            "gamma":      gamma_tgt,
-                            "brightness": brightness_tgt,
-                            "contrast":   contrast_tgt,
-                            "saturation": saturation_tgt,
+                            "gamma":       gamma_tgt,
+                            "brightness":  brightness_tgt,
+                            "contrast":    contrast_tgt,
+                            "saturation":  saturation_tgt,
+                            "shadow_lift": shadow_lift_tgt,
                         })
 
-                        mode = "🌑 意図的暗所" if is_extreme else "🔄 補正中"
+                        mode_name = self._rt_mode
+                        if is_extreme:
+                            status_text = (f"🌑 演出保護のため補正を抑制中({mode_name})"
+                                           f"  強さ:{shadow_lift_tgt:.2f}")
+                        elif mode_name == "極暗":
+                            status_text = (f"🌌 極暗モードで補正中"
+                                           f"  強さ:{shadow_lift_tgt:.2f}")
+                        else:
+                            status_text = (f"🔄 暗部を補正中({mode_name})"
+                                           f"  強さ:{shadow_lift_tgt:.2f}")
                         self.root.after(0,
-                            lambda m=mode, df=dark_factor,
-                                   rm=ratio_mean,
-                                   b=brightness_tgt, g=gamma_tgt,
-                                   c=contrast_tgt, s=saturation_tgt:
-                            self._auto_adj_status.set(
-                                f"{m}  比率:{rm:.2f}  補正:{df:.2f}"
-                                f"  B:{b:.0f}  γ:{g:.0f}  C:{c:.0f}  S:{s:.0f}"))
+                            lambda t=status_text: self._auto_adj_status.set(t))
             self._rt_stop.wait(0.5)
 
     def _rt_blend_step(self):
@@ -3185,6 +3454,14 @@ class VideoPlayer:
                         self.player[key] = mpv_val
                     except Exception:
                         pass
+
+            # シャドウリフト（float 0.0〜1.0のGLSL空間、int丸めはしない）
+            sl_cur = self._rt_current.get("shadow_lift", 0.0)
+            sl_tgt = self._rt_targets.get("shadow_lift", 0.0)
+            if abs(sl_cur - sl_tgt) > 0.005:
+                sl_new = sl_cur + (sl_tgt - sl_cur) * ALPHA
+                self._rt_current["shadow_lift"] = sl_new
+                self._apply_shadow_lift(sl_new)
 
     def _blend_loop(self):
         if self._rt_enabled:
