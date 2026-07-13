@@ -1252,7 +1252,8 @@ class VideoPlayer:
             self._auto_adj_status.set(message)
 
     def _flash_shot_btn(self, text):
-        orig = "📷"
+        # 操作バー上の現在の表記（SS）へ戻す。旧UIの📷表記を残さない。
+        orig = "SS"
         self._shot_btn.config(text=text)
         self.root.after(700, lambda: self._shot_btn.config(text=orig))
 
@@ -1402,7 +1403,7 @@ class VideoPlayer:
         tk.Label(win, text="Lumveil",
                  bg=BG_ADJ, fg=COL_BLU,
                  font=("Segoe UI", 20, "bold")).pack(pady=(24, 4))
-        tk.Label(win, text="ver. 1.7",
+        tk.Label(win, text="ver. 1.8",
                  bg=BG_ADJ, fg=COL_DIM,
                  font=("Segoe UI", 9)).pack()
         tk.Frame(win, bg="#333333", height=1).pack(fill=tk.X, padx=30, pady=14)
@@ -1429,7 +1430,7 @@ class VideoPlayer:
         self._settings_win.title("設定")
         self._settings_win.configure(bg=BG_ADJ)
         self._settings_win.resizable(True, True)
-        self._settings_win.minsize(520, 420)
+        self._settings_win.minsize(680, 480)
         self._settings_win.withdraw()
         self._settings_win.protocol("WM_DELETE_WINDOW", self._settings_win.withdraw)
         self._adj_win = self._settings_win
@@ -1691,19 +1692,67 @@ class VideoPlayer:
                  font=("Segoe UI", 8), anchor="w").pack(fill=tk.X, padx=10, pady=(2, 0))
         return body
 
+    def _make_vertical_scroll_area(self, parent):
+        """タブの見出しを固定したまま、長い設定内容だけを縦スクロールさせる。"""
+        holder = tk.Frame(parent, bg=BG_ADJ)
+        holder.pack(fill=tk.BOTH, expand=True)
+        canvas = tk.Canvas(holder, bg=BG_ADJ, highlightthickness=0)
+        scrollbar = tk.Scrollbar(holder, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        content = tk.Frame(canvas, bg=BG_ADJ)
+        window_id = canvas.create_window((0, 0), window=content, anchor="nw")
+
+        def _update_scrollregion():
+            # 内容が表示領域より短い時までCanvasを動かせると、上部に空白が生じる。
+            # 領域を少なくとも表示サイズまでに固定し、常に先頭位置へ戻す。
+            canvas.configure(scrollregion=(0, 0, canvas.winfo_width(),
+                                           max(content.winfo_reqheight(), canvas.winfo_height())))
+            if content.winfo_reqheight() <= canvas.winfo_height():
+                canvas.yview_moveto(0)
+
+        content.bind("<Configure>", lambda _e: _update_scrollregion())
+        canvas.bind("<Configure>", lambda e: (canvas.itemconfigure(window_id, width=e.width),
+                                                _update_scrollregion()))
+
+        def _contains(widget):
+            """ホイール発生元がこのスクロール領域の子か判定する。"""
+            while widget:
+                if widget is content or widget is canvas:
+                    return True
+                widget = getattr(widget, "master", None)
+            return False
+
+        def _on_wheel(event):
+            if not _contains(event.widget):
+                return None
+            if content.winfo_reqheight() <= canvas.winfo_height():
+                canvas.yview_moveto(0)
+                return "break"
+            delta = -1 if event.delta > 0 else 1
+            canvas.yview_scroll(delta * 3, "units")
+            return "break"
+
+        # 共通ホイール処理（_on_mousewheel）から呼び出す。後から動画側の
+        # bind_allが登録されても設定タブ側の処理が上書きされないようにする。
+        self._advanced_wheel_handler = _on_wheel
+        return content
+
     def _build_gpu_win(self):
         # 高度な項目は1タブに集め、必要な項目だけ開ける折りたたみ式にする。
         self._advanced_tab = tk.Frame(self._settings_tabs, bg=BG_ADJ)
         self._settings_tabs.add(self._advanced_tab, text="詳細設定")
         self._add_settings_tab_intro(self._advanced_tab, "詳細設定", "GPU・シェーダーなど、画質を細かく調整したいときに使います。")
+        self._advanced_content = self._make_vertical_scroll_area(self._advanced_tab)
         self._smooth_tab = self._add_advanced_section(
-            self._advanced_tab, "なめらかさ", "フレーム補間・ノイズ軽減")
+            self._advanced_content, "なめらかさ", "フレーム補間・ノイズ軽減")
         self._decode_tab = self._add_advanced_section(
-            self._advanced_tab, "GPU再生支援", "GPUデコードの設定")
+            self._advanced_content, "GPU再生支援", "GPUデコードの設定")
         self._shader_tab = self._add_advanced_section(
-            self._advanced_tab, "シェーダー", "拡大・Anime4K・外部GLSL")
+            self._advanced_content, "シェーダー", "拡大・Anime4K・外部GLSL")
         self._output_tab = self._add_advanced_section(
-            self._advanced_tab, "映像出力", "HDR変換・ディザリング・デインターレース")
+            self._advanced_content, "映像出力", "HDR変換・ディザリング・デインターレース")
         self._gpu_win = self._settings_win
         win = self._shader_tab
 
@@ -2080,7 +2129,7 @@ class VideoPlayer:
         """常時表示の切替と並び順を、実物に近いプレビューで設定する。"""
         if hasattr(self, "_toolbar_section"):
             self._toolbar_section.destroy()
-        self._toolbar_section = tk.Frame(self._advanced_tab, bg=BG_ADJ)
+        self._toolbar_section = tk.Frame(self._advanced_content, bg=BG_ADJ)
         self._toolbar_section.pack(fill=tk.X, padx=12, pady=(3, 0))
         tab = self._add_advanced_section(
             self._toolbar_section, "操作バー", "表示するボタンと並び順")
@@ -3386,6 +3435,9 @@ class VideoPlayer:
         self.root.bind_all("<MouseWheel>", self._on_mousewheel)
 
     def _on_mousewheel(self, event):
+        handler = getattr(self, "_advanced_wheel_handler", None)
+        if handler and handler(event) == "break":
+            return "break"
         # bind_allは画面座標が動画キャンバスと重なっていれば発火するため、
         # サブウィンドウ（設定画面等、動画キャンバスに重ねて開く）が前面にある
         # 状態でホイール操作すると音量が変わってしまうクリック貫通と同種のバグを防ぐ。
