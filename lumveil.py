@@ -125,6 +125,19 @@ RT_MODE_COLORS = {
     "極暗":         COL_PUR,
 }
 
+# 用途別画質プリセット。詳細設定を知らなくても、画質と負荷の優先度を選べる。
+# 外部GLSLは利用者の設定資産のため、ここでは変更しない。
+QUALITY_PRESETS = {
+    "軽快":       {"scale": "bilinear", "cscale": "bilinear", "deband": False,
+                   "interpolate": False, "anime": "なし", "rt_mode": None},
+    "標準":       {"scale": "lanczos", "cscale": "spline36", "deband": False,
+                   "interpolate": True,  "anime": "なし", "rt_mode": None},
+    "アニメ高画質": {"scale": "lanczos", "cscale": "spline36", "deband": True,
+                   "interpolate": True,  "anime": "モードA", "rt_mode": None},
+    "暗所優先":   {"scale": "lanczos", "cscale": "spline36", "deband": False,
+                   "interpolate": True,  "anime": "なし", "rt_mode": "標準"},
+}
+
 
 # ── ツールチップ ─────────────────────────────────────────────────────────
 class _ToolTip:
@@ -300,6 +313,8 @@ class VideoPlayer:
         self._gpu_deinterlace = False
         self._gpu_amf_frc     = False  # AMD AMF専用のGPUハードウェアフレーム補間
         self._gpu_glsl        = []   # list of absolute shader paths
+        self._quality_preset  = "カスタム"
+        self._applying_quality_preset = False
         self._load_gpu_settings()
         # AUTO強度モードのみ起動時に自動復元する（スライダー値は手動読込ボタン
         # 経由でのみ復元する既存挙動を維持）。AUTO自体は自動開始しない。
@@ -1128,6 +1143,18 @@ class VideoPlayer:
         win.geometry(f"+{max(x,0)}+{max(y,0)}")
         win.focus_force()
 
+    def _set_settings_error(self, operation, error):
+        """設定画面で完結する操作の失敗を、非モーダルに明示する。
+
+        再生中に何度も起こり得る軽微な例外へダイアログを出すと操作を妨げるため、
+        GPU/シェーダー/設定保存に限って既存のステータス欄へ理由を表示する。
+        """
+        message = f"⚠ {operation}に失敗: {error}"
+        if hasattr(self, "_gpu_status"):
+            self._gpu_status.set(message)
+        if hasattr(self, "_auto_adj_status"):
+            self._auto_adj_status.set(message)
+
     def _flash_shot_btn(self, text):
         orig = "📷"
         self._shot_btn.config(text=text)
@@ -1287,6 +1314,29 @@ class VideoPlayer:
         self._picture_tab = win
         self._settings_tabs.add(win, text="画質")
         self._add_settings_tab_intro(win, "画質", "明るさ・色味・字幕と音声の見た目を調整します。")
+
+        quality_row = tk.Frame(win, bg=BG_ADJ)
+        quality_row.pack(fill=tk.X, padx=16, pady=(8, 4))
+        tk.Label(quality_row, text="用途別プリセット:", bg=BG_ADJ, fg=COL_TXT,
+                 font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(0, 6))
+        self._quality_preset_btns = {}
+        quality_tips = {
+            "軽快": "負荷を抑えたいとき。Anime4Kと通常フレーム補間を停止します。",
+            "標準": "普段使い向け。画質と軽快さのバランスを取ります。",
+            "アニメ高画質": "Anime4Kとデバンディングでアニメをきれいに表示します。",
+            "暗所優先": "⚡AUTOを使う準備を整えます。動画を開くまでAUTOは開始しません。",
+        }
+        for pname in QUALITY_PRESETS:
+            b = self._btn(quality_row, pname,
+                          lambda p=pname: self._apply_quality_preset(p),
+                          bg=BG_ADJ, pad=(7, 3), tooltip=quality_tips[pname])
+            b.pack(side=tk.LEFT, padx=2)
+            self._quality_preset_btns[pname] = b
+        self._quality_preset_status = tk.StringVar()
+        tk.Label(win, textvariable=self._quality_preset_status,
+                 bg=BG_ADJ, fg=COL_DIM, font=("Segoe UI", 8)).pack(
+                     anchor="w", padx=16, pady=(0, 2))
+        self._sync_quality_preset_buttons()
 
         mode_row = tk.Frame(win, bg=BG_ADJ)
         mode_row.pack(fill=tk.X, padx=16, pady=(8, 4))
@@ -1932,9 +1982,66 @@ class VideoPlayer:
             self._settings_win.deiconify()
         self._settings_win.lift()
 
+    def _sync_quality_preset_buttons(self):
+        """用途別プリセットの選択状態を画質タブへ反映する。"""
+        if not hasattr(self, "_quality_preset_btns"):
+            return
+        for name, btn in self._quality_preset_btns.items():
+            btn.config(fg=COL_GRN if name == self._quality_preset else COL_TXT)
+        if hasattr(self, "_quality_preset_status"):
+            text = (f"選択中: {self._quality_preset}"
+                    if self._quality_preset in QUALITY_PRESETS
+                    else "選択中: カスタム（詳細設定を手動変更）")
+            self._quality_preset_status.set(text)
+
+    def _mark_quality_custom(self):
+        """用途別プリセットの管理対象を手動変更したことを表示する。"""
+        if not self._applying_quality_preset and self._quality_preset != "カスタム":
+            self._quality_preset = "カスタム"
+            self._sync_quality_preset_buttons()
+
+    def _apply_quality_preset(self, name):
+        """用途別プリセットをまとめて適用する。外部GLSLは保持する。"""
+        preset = QUALITY_PRESETS.get(name)
+        if preset is None:
+            return
+        self._applying_quality_preset = True
+        try:
+            self._gpu_scale = preset["scale"]
+            self._gpu_cscale = preset["cscale"]
+            self._gpu_deband = preset["deband"]
+            self._gpu_interpolate = preset["interpolate"]
+            # AMF補間と通常補間の二重負荷を避ける。用途別プリセットではAMFを使わない。
+            self._gpu_amf_frc = False
+            self._apply_anime4k_preset(preset["anime"], save=False, show_status=False)
+            if preset["rt_mode"]:
+                self._rt_mode = preset["rt_mode"]
+                self._sync_rt_mode_buttons()
+            self._apply_gpu_settings()
+            self._apply_vf_chain()
+
+            # 設定UIを現在値へ同期する。
+            self._gpu_scale_var.set(next(label for value, label in self._SCALE_OPTIONS
+                                         if value == self._gpu_scale))
+            self._gpu_cscale_var.set(next(label for value, label in self._CSCALE_OPTIONS
+                                          if value == self._gpu_cscale))
+            self._deband_btn.config(text="ON" if self._gpu_deband else "OFF",
+                                    fg=COL_GRN if self._gpu_deband else COL_TXT)
+            self._interpolate_btn.config(text="ON" if self._gpu_interpolate else "OFF",
+                                         fg=COL_GRN if self._gpu_interpolate else COL_TXT)
+            self._amf_frc_btn.config(text="OFF", fg=COL_TXT)
+            self._quality_preset = name
+            self._sync_quality_preset_buttons()
+            self._save_gpu_settings()
+            suffix = "（AUTOは動画を開いてから開始できます）" if name == "暗所優先" else ""
+            self._gpu_status.set(f"✓ 用途別プリセット: {name}{suffix}")
+        finally:
+            self._applying_quality_preset = False
+
     def _on_gpu_scale(self, lbl):
         val = next(v for v, l in self._SCALE_OPTIONS if l == lbl)
         self._gpu_scale = val
+        self._mark_quality_custom()
         try:
             self.player["scale"] = val
             self._gpu_status.set(f"✓ スケール: {val}")
@@ -1945,6 +2052,7 @@ class VideoPlayer:
     def _on_gpu_cscale(self, lbl):
         val = next(v for v, l in self._CSCALE_OPTIONS if l == lbl)
         self._gpu_cscale = val
+        self._mark_quality_custom()
         try:
             self.player["cscale"] = val
             self._gpu_status.set(f"✓ クロマスケール: {val}")
@@ -1954,6 +2062,7 @@ class VideoPlayer:
 
     def _on_gpu_deband(self):
         self._gpu_deband = not self._gpu_deband
+        self._mark_quality_custom()
         self._deband_btn.config(
             text="ON" if self._gpu_deband else "OFF",
             fg=COL_GRN if self._gpu_deband else COL_TXT)
@@ -2014,6 +2123,7 @@ class VideoPlayer:
 
     def _on_gpu_interpolate(self):
         self._gpu_interpolate = not self._gpu_interpolate
+        self._mark_quality_custom()
         on = self._gpu_interpolate
         if on and self._gpu_amf_frc:
             # フレーム補間とAMD AMFフレーム補間は目的が重複し二重負荷になるため排他化
@@ -2050,7 +2160,7 @@ class VideoPlayer:
                 + ("（非AMD環境では自動的に無効のままです）" if on else ""))
         self._save_gpu_settings()
 
-    def _apply_anime4k_preset(self, name):
+    def _apply_anime4k_preset(self, name, *, save=True, show_status=True):
         files = ANIME4K_PRESETS.get(name)
         if files is None:
             return
@@ -2064,8 +2174,11 @@ class VideoPlayer:
         for p in self._gpu_glsl:
             self._glsl_listbox.insert(tk.END, os.path.basename(p))
         self._apply_glsl_shaders()
-        self._save_gpu_settings()
-        self._gpu_status.set(f"✓ Anime4Kプリセット適用: {name}")
+        if save:
+            self._mark_quality_custom()
+            self._save_gpu_settings()
+        if show_status:
+            self._gpu_status.set(f"✓ Anime4Kプリセット適用: {name}")
         for mname, btn in self._a4k_btns.items():
             btn.config(fg=COL_GRN if mname == name else COL_TXT)
 
@@ -2080,6 +2193,7 @@ class VideoPlayer:
                 self._gpu_glsl.append(p)
                 self._glsl_listbox.insert(tk.END, os.path.basename(p))
         if paths:
+            self._mark_quality_custom()
             self._apply_glsl_shaders()
             self._save_gpu_settings()
             self._gpu_status.set(f"✓ シェーダー追加: {len(self._gpu_glsl)}件")
@@ -2091,6 +2205,7 @@ class VideoPlayer:
         idx = sel[0]
         self._glsl_listbox.delete(idx)
         self._gpu_glsl.pop(idx)
+        self._mark_quality_custom()
         self._apply_glsl_shaders()
         self._save_gpu_settings()
         self._gpu_status.set(f"✓ シェーダー削除 ({len(self._gpu_glsl)}件残)")
@@ -2098,6 +2213,7 @@ class VideoPlayer:
     def _on_gpu_glsl_clear(self):
         self._gpu_glsl.clear()
         self._glsl_listbox.delete(0, tk.END)
+        self._mark_quality_custom()
         self._apply_glsl_shaders()
         self._save_gpu_settings()
         self._gpu_status.set("✓ シェーダー全クリア")
@@ -2113,16 +2229,16 @@ class VideoPlayer:
             if "contrast" in self._adj_vars:
                 self._apply_effective_contrast(self._adj_vars["contrast"][0].get())
             self._apply_shadow_lift(self._shader_opts.get("shadow_lift", 0.0))
-        except Exception:
-            pass
+        except Exception as e:
+            self._set_settings_error("シェーダーの適用", e)
 
     def _apply_shader_opts(self):
         """glsl-shader-optsは一括上書きのため、複数パラメータを一元管理してまとめて適用する。"""
         try:
             opts = ",".join(f"{k}={v:.3f}" for k, v in self._shader_opts.items())
             self.player.command("set", "glsl-shader-opts", opts)
-        except Exception:
-            pass
+        except Exception as e:
+            self._set_settings_error("シェーダー設定の反映", e)
 
     def _apply_effective_contrast(self, value):
         """-100〜+300の実効値を、MPV(+100まで)と拡張シェーダーへ連続して配分する。"""
@@ -2192,6 +2308,7 @@ class VideoPlayer:
         self._save_gpu_settings()
 
     def _reset_gpu(self):
+        self._mark_quality_custom()
         self._gpu_scale      = "lanczos"
         self._gpu_cscale     = "spline36"
         self._gpu_deband     = False
@@ -2265,12 +2382,13 @@ class VideoPlayer:
             "deinterlace": self._gpu_deinterlace,
             "amf_frc":     self._gpu_amf_frc,
             "glsl":        self._gpu_glsl,
+            "quality_preset": self._quality_preset,
         }
         try:
             with open(GPU_SETTINGS, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
-        except Exception:
-            pass
+        except Exception as e:
+            self._set_settings_error("GPU設定の保存", e)
 
     def _load_gpu_settings(self):
         if not os.path.exists(GPU_SETTINGS):
@@ -2292,6 +2410,8 @@ class VideoPlayer:
             self._gpu_amf_frc     = data.get("amf_frc",     self._gpu_amf_frc)
             self._gpu_glsl        = [p for p in data.get("glsl", [])
                                      if os.path.exists(p)]
+            saved_preset = data.get("quality_preset", "カスタム")
+            self._quality_preset = saved_preset if saved_preset in QUALITY_PRESETS else "カスタム"
         except Exception:
             pass
 
@@ -2311,8 +2431,8 @@ class VideoPlayer:
                 self.player["video-sync"]    = "display-resample"
                 self.player["interpolation"] = True
                 self.player["tscale"]        = "oversample"
-        except Exception:
-            pass
+        except Exception as e:
+            self._set_settings_error("GPU設定の適用", e)
         self._apply_glsl_shaders()
         self._apply_vf_chain()
 
@@ -3120,6 +3240,7 @@ class VideoPlayer:
                 self._sync_rt_mode_buttons()
             return
         self._rt_mode = name
+        self._mark_quality_custom()
         if not self._rt_enabled:
             self._toggle_rt_adj()
         else:
