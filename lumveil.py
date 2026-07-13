@@ -507,8 +507,8 @@ class VideoPlayer:
                     "folder_end_action": self._folder_end_action,
                     "playlist_sort": self._playlist_sort,
                 }, f, ensure_ascii=False)
-        except Exception:
-            pass
+        except Exception as e:
+            self._set_settings_error("プレイヤー設定の保存", e)
 
     def _toggle_always_on_top(self):
         self._always_on_top = not self._always_on_top
@@ -1043,8 +1043,8 @@ class VideoPlayer:
         try:
             with open(BOOKMARKS_FILE, "w", encoding="utf-8") as f:
                 json.dump(self._bookmarks, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+        except Exception as e:
+            self._set_settings_error("ブックマークの保存", e)
 
     def _fmt_ms(self, pos_ms):
         h, rem = divmod(max(0, pos_ms) // 1000, 3600)
@@ -1150,6 +1150,8 @@ class VideoPlayer:
         GPU/シェーダー/設定保存に限って既存のステータス欄へ理由を表示する。
         """
         message = f"⚠ {operation}に失敗: {error}"
+        if hasattr(self, "_settings_status"):
+            self._settings_status.set(message)
         if hasattr(self, "_gpu_status"):
             self._gpu_status.set(message)
         if hasattr(self, "_auto_adj_status"):
@@ -1310,6 +1312,10 @@ class VideoPlayer:
         self._adj_win = self._settings_win
         self._settings_tabs = ttk.Notebook(self._settings_win, style="Lumveil.TNotebook")
         self._settings_tabs.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self._settings_status = tk.StringVar(value="")
+        tk.Label(self._settings_win, textvariable=self._settings_status,
+                 bg=BG_ADJ, fg=COL_YEL, anchor="w",
+                 font=("Segoe UI", 8), padx=12, pady=3).pack(fill=tk.X, side=tk.BOTTOM)
         win = tk.Frame(self._settings_tabs, bg=BG_ADJ)
         self._picture_tab = win
         self._settings_tabs.add(win, text="画質")
