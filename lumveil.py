@@ -340,6 +340,7 @@ class VideoPlayer:
         self._always_on_top = False
         self._playlist      = []
         self._playlist_idx  = -1
+        self._playlist_popup = None
         # 再生設定（初期値は従来の挙動を維持）
         self._playback_eof_action = "next"   # next / stop
         self._resume_enabled      = True
@@ -355,12 +356,12 @@ class VideoPlayer:
         # 右側の操作バーは、よく使う項目だけを常時表示できる。
         # どの項目も「…」メニューから実行できるため、非表示にしても機能は失われない。
         self._toolbar_default_visible = {
-            "speed", "subtitles", "audio", "screenshot", "bookmark",
+            "speed", "playlist", "subtitles", "audio", "screenshot", "bookmark",
             "auto_adjust", "fullscreen",
         }
         self._toolbar_visible = set(self._toolbar_default_visible)
         self._toolbar_order = [
-            "fullscreen", "auto_adjust", "speed", "subtitles", "audio",
+            "fullscreen", "auto_adjust", "speed", "playlist", "subtitles", "audio",
             "screenshot", "bookmark", "pin", "recent", "ab_repeat", "gpu", "about",
         ]
         self._toolbar_items = {}
@@ -745,6 +746,9 @@ class VideoPlayer:
         f, _ = self._fixed_btn(right, "🕘", self._show_recent_menu, w=30,
                                font=("Segoe UI", 11), tooltip="最近開いたファイル")
         self._toolbar_items["recent"] = f
+        f, _ = self._fixed_btn(right, "☷", self._show_playlist, w=30,
+                               font=("Segoe UI", 13), tooltip="再生リスト")
+        self._toolbar_items["playlist"] = f
         f, _ = self._fixed_btn(right, "🎵", lambda: self._show_track_menu("audio"), w=30,
                                font=("Segoe UI", 11), tooltip="音声トラック")
         self._toolbar_items["audio"] = f
@@ -817,6 +821,7 @@ class VideoPlayer:
             "settings":    ("設定", self._toggle_adj_win),
             "gpu":         ("GPU / シェーダー設定", self._toggle_gpu_win),
             "recent":      ("最近開いたファイル", self._show_recent_menu),
+            "playlist":    ("再生リスト", self._show_playlist),
             "audio":       ("音声トラック", lambda: self._show_track_menu("audio")),
             "subtitles":   ("字幕トラック", lambda: self._show_track_menu("sub")),
             "ab_repeat":   ("A-Bリピート", self._toggle_ab_loop),
@@ -978,7 +983,7 @@ class VideoPlayer:
                        activebackground=BG_BTN_H, activeforeground=COL_TXT,
                        font=("Segoe UI", 9))
         definitions = self._toolbar_item_definitions()
-        for key in ("fullscreen", "pin", "auto_adjust", "settings", "gpu", "recent",
+        for key in ("fullscreen", "pin", "auto_adjust", "settings", "gpu", "recent", "playlist",
                     "subtitles", "audio", "ab_repeat", "screenshot", "bookmark", "about"):
             label, command = definitions[key]
             menu.add_command(label=label, command=command)
@@ -1029,6 +1034,95 @@ class VideoPlayer:
         win.geometry(f"+{max(x,0)}+{max(y,0)}")
         win.bind("<FocusOut>", lambda e: win.destroy())
         win.focus_force()
+
+    # ── 再生リスト ───────────────────────────────────────────────────────
+
+    def _show_playlist(self):
+        """現在のフォルダまたはD&Dで作られた再生リストを表示する。"""
+        if not self._playlist:
+            self._set_settings_error("再生リストの表示", "動画を開いてください")
+            return
+        if self._playlist_popup and self._playlist_popup.winfo_exists():
+            self._refresh_playlist_popup()
+            self._playlist_popup.deiconify()
+            self._playlist_popup.lift()
+            self._playlist_popup.focus_force()
+            return
+
+        win = tk.Toplevel(self.root)
+        self._playlist_popup = win
+        win.title("再生リスト")
+        win.configure(bg=BG_ADJ)
+        win.transient(self.root)
+        win.geometry("500x360")
+        win.minsize(360, 240)
+        win.protocol("WM_DELETE_WINDOW", self._close_playlist_popup)
+
+        head = tk.Frame(win, bg=BG_ADJ)
+        head.pack(fill=tk.X, padx=12, pady=(12, 6))
+        self._playlist_summary = tk.StringVar()
+        tk.Label(head, text="再生リスト", bg=BG_ADJ, fg=COL_TXT,
+                 font=("Segoe UI", 12, "bold")).pack(side=tk.LEFT)
+        tk.Label(head, textvariable=self._playlist_summary, bg=BG_ADJ, fg=COL_DIM,
+                 font=("Segoe UI", 9)).pack(side=tk.RIGHT)
+
+        body = tk.Frame(win, bg=BG_ADJ)
+        body.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 8))
+        scroll = tk.Scrollbar(body, orient=tk.VERTICAL)
+        self._playlist_listbox = tk.Listbox(
+            body, bg="#1a1a1a", fg=COL_TXT, selectbackground="#2a4a6a",
+            selectforeground=COL_TXT, activestyle="none", relief=tk.FLAT, bd=0,
+            font=("Segoe UI", 10), yscrollcommand=scroll.set)
+        scroll.config(command=self._playlist_listbox.yview)
+        self._playlist_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self._playlist_listbox.bind("<Double-Button-1>", self._play_selected_from_popup)
+        self._playlist_listbox.bind("<Return>", self._play_selected_from_popup)
+
+        foot = tk.Frame(win, bg=BG_ADJ)
+        foot.pack(fill=tk.X, padx=12, pady=(0, 10))
+        self._btn(foot, "前の動画", self._playlist_popup_prev,
+                  bg=BG_ADJ, pad=(9, 4)).pack(side=tk.LEFT)
+        self._btn(foot, "次の動画", self._playlist_popup_next,
+                  bg=BG_ADJ, pad=(9, 4)).pack(side=tk.LEFT, padx=4)
+        self._btn(foot, "閉じる", self._close_playlist_popup,
+                  bg=BG_ADJ, pad=(9, 4)).pack(side=tk.RIGHT)
+        self._refresh_playlist_popup()
+        win.lift()
+        win.focus_force()
+
+    def _refresh_playlist_popup(self):
+        if not (self._playlist_popup and self._playlist_popup.winfo_exists()
+                and hasattr(self, "_playlist_listbox")):
+            return
+        self._playlist_summary.set(f"{len(self._playlist)}件  {self._playlist_idx + 1}/{len(self._playlist)}")
+        self._playlist_listbox.delete(0, tk.END)
+        for idx, path in enumerate(self._playlist):
+            marker = "▶ " if idx == self._playlist_idx else "   "
+            self._playlist_listbox.insert(tk.END, f"{marker}{os.path.basename(path)}")
+        if 0 <= self._playlist_idx < len(self._playlist):
+            self._playlist_listbox.selection_set(self._playlist_idx)
+            self._playlist_listbox.see(self._playlist_idx)
+
+    def _close_playlist_popup(self):
+        if self._playlist_popup and self._playlist_popup.winfo_exists():
+            self._playlist_popup.destroy()
+        self._playlist_popup = None
+
+    def _play_selected_from_popup(self, _event=None):
+        selection = self._playlist_listbox.curselection()
+        if not selection:
+            return
+        self._play_list(self._playlist, selection[0])
+        self._close_playlist_popup()
+
+    def _playlist_popup_prev(self):
+        self._play_prev()
+        self._refresh_playlist_popup()
+
+    def _playlist_popup_next(self):
+        self._play_next()
+        self._refresh_playlist_popup()
 
     # ── ブックマーク ─────────────────────────────────────────────────────
 
@@ -1926,7 +2020,7 @@ class VideoPlayer:
         self._settings_tabs.add(tab, text="操作バー")
         self._toolbar_icons = {
             "fullscreen": "⛶", "pin": "📌", "about": "ⓘ", "auto_adjust": "⚡",
-            "gpu": "⚙ GPU", "recent": "🕘", "audio": "🎵", "subtitles": "💬",
+            "gpu": "⚙ GPU", "recent": "🕘", "playlist": "☷", "audio": "🎵", "subtitles": "💬",
             "ab_repeat": "A-B", "screenshot": "📷", "bookmark": "🔖", "speed": "1.00×",
         }
         tk.Label(tab, text="操作バー", bg=BG_ADJ, fg=COL_TXT,
@@ -2850,6 +2944,7 @@ class VideoPlayer:
         self._add_recent_file(path)
         if not _from_playlist:
             self._build_folder_playlist(path)
+        self._refresh_playlist_popup()
 
     # ── プレイリスト・連続再生 ────────────────────────────────────────────
 
@@ -3146,6 +3241,7 @@ class VideoPlayer:
         TITLE_H = 35
         for win in (getattr(self, "_adj_win", None),
                     getattr(self, "_gpu_win", None),
+                    getattr(self, "_playlist_popup", None),
                     getattr(self, "prev_popup", None),
                     getattr(self, "_about_win", None),
                     getattr(self, "_menu_popup", None)):
