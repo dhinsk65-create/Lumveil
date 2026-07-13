@@ -13,3 +13,8 @@ libmpv.dll.a
 # ユーザー実行時設定(差分ノイズ防止)
 adj_settings_mpv.json
 gpu_settings_mpv.json
+
+# 開発内部メモ(ローカル参照用、Publicリポジトリには非公開)
+note_v1.*.md
+dark_auto_quality_review_*.md
+HANDOFF_*.md
