@@ -1330,6 +1330,9 @@ class VideoPlayer:
             off_fg = COL_GRN if not cur else COL_TXT
             self._btn(win, "オフ", lambda: pick(False), bg=BG_ADJ,
                       pad=(14, 4)).pack(fill=tk.X, padx=4, pady=1)
+            self._btn(win, "＋ 外部字幕を追加…",
+                      self._chain(win.destroy, self._add_external_subtitle),
+                      bg=BG_ADJ, pad=(14, 4)).pack(fill=tk.X, padx=4, pady=1)
 
         if not tracks:
             tk.Label(win, text="（トラックなし）", bg=BG_ADJ, fg=COL_DIM,
@@ -1351,6 +1354,32 @@ class VideoPlayer:
         win.geometry(f"+{max(x,0)}+{max(y,0)}")
         win.bind("<FocusOut>", lambda e: win.destroy())
         win.focus_force()
+
+    def _add_external_subtitle(self):
+        """現在の動画へ外部字幕を追加し、そのまま選択する。"""
+        if not self._current_path:
+            self._show_error_popup("外部字幕を追加する動画を開いてください。")
+            return
+        initialdir = os.path.dirname(self._current_path)
+        path = self._ask_file(
+            filedialog.askopenfilename,
+            title="外部字幕ファイルを選択",
+            initialdir=initialdir,
+            filetypes=[
+                ("字幕ファイル", "*.srt *.ass *.ssa *.vtt *.sub *.smi *.sami *.idx"),
+                ("すべてのファイル", "*.*"),
+            ])
+        if not path:
+            return
+        path = os.path.abspath(path)
+        title = os.path.splitext(os.path.basename(path))[0]
+        try:
+            # cachedは同じファイルを再選択しても二重に追加せず、直ちに選択する。
+            self.player.command("sub-add", path, "cached", title)
+            if hasattr(self, "_auto_adj_status"):
+                self._auto_adj_status.set(f"✓ 外部字幕を追加: {os.path.basename(path)}")
+        except Exception as e:
+            self._show_error_popup(f"外部字幕を追加できませんでした:\n{e}")
 
     # ── About ─────────────────────────────────────────────────────────────
 
