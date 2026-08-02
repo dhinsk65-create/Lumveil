@@ -1832,13 +1832,133 @@ class VideoPlayer:
         self._settings_win.lift()
 
     def _open_license_notices(self):
-        path = os.path.join(_SCRIPT_DIR, "THIRD_PARTY_NOTICES.md")
-        if not os.path.isfile(path):
+        # In a PyInstaller one-dir build __file__ is under _internal, while
+        # release documents are copied beside the executable.
+        resource_roots = (
+            _SCRIPT_DIR,
+            os.path.dirname(_SCRIPT_DIR),
+            os.path.dirname(os.path.abspath(sys.executable)),
+        )
+        path = next(
+            (os.path.join(root, "THIRD_PARTY_NOTICES.md")
+             for root in resource_roots
+             if os.path.isfile(os.path.join(root, "THIRD_PARTY_NOTICES.md"))),
+            None,
+        )
+        if path is None:
             if hasattr(self, "_update_status_var"):
                 self._update_status_var.set("THIRD_PARTY_NOTICES.md was not found.")
             return
+
+        if (hasattr(self, "_license_win") and self._license_win
+                and self._license_win.winfo_exists()):
+            self._license_win.deiconify()
+            self._license_win.lift()
+            self._license_win.focus_force()
+            return
+
         try:
-            os.startfile(path)
+            documents = [("THIRD_PARTY_NOTICES.md", path)]
+            license_dir = os.path.join(os.path.dirname(path), "licenses")
+            if os.path.isdir(license_dir):
+                for filename in sorted(os.listdir(license_dir), key=str.casefold):
+                    license_path = os.path.join(license_dir, filename)
+                    if os.path.isfile(license_path):
+                        documents.append((filename, license_path))
+
+            contents = {}
+            for filename, document_path in documents:
+                try:
+                    with open(document_path, "r", encoding="utf-8", errors="replace") as handle:
+                        contents[filename] = handle.read()
+                except OSError as exc:
+                    contents[filename] = f"Unable to read {filename}:\n{exc}"
+
+            win = tk.Toplevel(self.root)
+            self._license_win = win
+            win.title("Third-party licenses")
+            win.configure(bg=BG_ADJ)
+            win.resizable(True, True)
+            win.minsize(700, 500)
+            win.geometry("820x620")
+            win.transient(self._settings_win if self._settings_win.winfo_exists() else self.root)
+            _apply_dark_titlebar(win)
+
+            head = tk.Frame(win, bg=BG_ADJ)
+            head.pack(fill=tk.X, padx=18, pady=(14, 8))
+            tk.Label(head, text="Third-party licenses", bg=BG_ADJ, fg=COL_TXT,
+                     font=("Segoe UI", 14, "bold"), anchor="w").pack(fill=tk.X)
+            tk.Label(
+                head,
+                text="Bundled notices and license texts. Select a document to read it.",
+                bg=BG_ADJ, fg=COL_DIM, font=("Segoe UI", 9), anchor="w",
+            ).pack(fill=tk.X, pady=(3, 0))
+
+            body = tk.Frame(win, bg=BG_ADJ)
+            body.pack(fill=tk.BOTH, expand=True, padx=18, pady=(0, 10))
+
+            list_frame = tk.Frame(body, bg=BG_CTRL, width=220)
+            list_frame.pack(side=tk.LEFT, fill=tk.Y)
+            list_frame.pack_propagate(False)
+            tk.Label(list_frame, text="Documents", bg=BG_CTRL, fg=COL_TXT,
+                     font=("Segoe UI", 9, "bold"), anchor="w").pack(
+                         fill=tk.X, padx=10, pady=(10, 6))
+            document_list = tk.Listbox(
+                list_frame, bg=BG_CTRL, fg=COL_TXT,
+                selectbackground=BG_SELECTED, selectforeground=COL_BLU,
+                relief=tk.FLAT, bd=0, highlightthickness=0,
+                activestyle="none", font=("Segoe UI", 9),
+            )
+            document_list.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 8))
+
+            text_frame = tk.Frame(body, bg=BG_CTRL)
+            text_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 0))
+            document_text = tk.Text(
+                text_frame, bg="#0A1118", fg=COL_TXT,
+                insertbackground=COL_TXT, relief=tk.FLAT, bd=0,
+                highlightthickness=0, wrap=tk.WORD,
+                font=("Consolas", 9), padx=12, pady=10,
+            )
+            document_scroll = tk.Scrollbar(
+                text_frame, orient=tk.VERTICAL, command=document_text.yview,
+                bg=BG_CTRL, troughcolor=BG_ADJ, activebackground=BG_BTN_H,
+            )
+            document_text.configure(yscrollcommand=document_scroll.set)
+            document_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+            document_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+            def show_document(_event=None):
+                selection = document_list.curselection()
+                if not selection:
+                    return
+                filename = documents[selection[0]][0]
+                document_text.configure(state=tk.NORMAL)
+                document_text.delete("1.0", tk.END)
+                document_text.insert("1.0", contents[filename])
+                document_text.configure(state=tk.DISABLED)
+                document_text.yview_moveto(0)
+
+            for filename, _document_path in documents:
+                document_list.insert(tk.END, filename)
+            document_list.bind("<<ListboxSelect>>", show_document)
+            if documents:
+                document_list.selection_set(0)
+                document_list.activate(0)
+                show_document()
+
+            def close_license_window():
+                self._license_win = None
+                win.destroy()
+
+            foot = tk.Frame(win, bg=BG_ADJ)
+            foot.pack(fill=tk.X, padx=18, pady=(0, 14))
+            self._btn(foot, "Close", close_license_window, bg=BG_ADJ,
+                      pad=(12, 5)).pack(side=tk.RIGHT)
+
+            win.protocol("WM_DELETE_WINDOW", close_license_window)
+            win.bind("<Escape>", lambda _event: close_license_window())
+            win.lift()
+            win.focus_force()
         except Exception as exc:
             if hasattr(self, "_update_status_var"):
                 self._update_status_var.set(f"Could not open license notices: {exc}")
