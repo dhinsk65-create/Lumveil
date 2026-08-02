@@ -5,12 +5,14 @@ Video Player MPV版  ―  YouTube スタイル UI
         → https://mpv.io/installation/ の "Windows" から入手
   pip install python-mpv pillow tkinterdnd2
 """
-import os, sys, shutil, subprocess, threading, time, math, json
+import os, sys, shutil, subprocess, threading, time, math, json, ctypes
+import hashlib, re, tempfile, urllib.error, urllib.request, webbrowser
 
 # libmpv-2.dll をスクリプトと同じフォルダから確実に読み込む
 os.environ["PATH"] = os.path.dirname(os.path.abspath(__file__)) + os.pathsep + os.environ["PATH"]
 import tkinter as tk
-from tkinter import filedialog, ttk
+from tkinter import filedialog, messagebox, ttk
+from tkinter import font as tkfont
 
 import mpv
 from PIL import Image, ImageTk
@@ -21,6 +23,10 @@ SEEK_SEC       = 5
 PREV_W, PREV_H = 192, 108
 CACHE_MAX      = 30
 SNAP_STEP      = 2
+APP_VERSION     = "2.0.0"
+GITHUB_REPO     = "dhinsk65-create/Lumveil"
+GITHUB_URL      = f"https://github.com/{GITHUB_REPO}"
+UPDATE_CHECK_INTERVAL = 6 * 60 * 60
 AMF_FRC_MAX_FPS = 50.0  # 元動画がこれを超えるfpsならAMD AMFフレーム補間を自動バイパス
 FFMPEG         = shutil.which("ffmpeg")
 
@@ -28,6 +34,15 @@ _SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 _RT_CONTRAST_SHADER_PATH = os.path.join(_SCRIPT_DIR, "shaders", "lumveil_auto_contrast.glsl")
 _RT_SHADOW_SHADER_PATH  = os.path.join(_SCRIPT_DIR, "shaders", "lumveil_shadow_lift.glsl")
 _SHADER_DIR     = os.path.join(_SCRIPT_DIR, "shaders")
+
+if not FFMPEG:
+    for _ffmpeg_candidate in (
+        os.path.join(_SCRIPT_DIR, "ffmpeg.exe"),
+        os.path.join(os.path.dirname(_SCRIPT_DIR), "ffmpeg.exe"),
+    ):
+        if os.path.isfile(_ffmpeg_candidate):
+            FFMPEG = _ffmpeg_candidate
+            break
 
 # Anime4K公式プリセット（bloc97/Anime4K のGLSL_Instructions_Advanced.mdに準拠）
 # サイズはM（速度と画質のバランス型）を採用。S=速いが荒い、VL=遅いが高画質。
@@ -102,19 +117,53 @@ VIDEO_EXTS = {
 }
 
 
-BG_VIDEO = "#000000"
-BG_CTRL  = "#0f0f0f"
-BG_BTN   = "#0f0f0f"
-BG_BTN_H = "#2a2a2a"
-BG_RED   = "#c0392b"
-BG_ADJ   = "#111111"
-COL_TXT  = "#ffffff"
-COL_DIM  = "#aaaaaa"
-COL_BLU  = "#4fc3f7"
-COL_YEL  = "#ffcc02"
-COL_GRN  = "#00b050"
-COL_PUR  = "#b388ff"
+# Lumveil v2.0 palette. The video surface remains near-black so the content
+# stays visually dominant while the controls use a restrained blue/cyan glass.
+BG_VIDEO   = "#05080D"
+BG_APP     = "#0A0F15"
+BG_CTRL    = "#0D151D"
+BG_BTN     = "#101B24"
+BG_BTN_H   = "#1A2A35"
+BG_BORDER  = "#283844"
+BG_PRESSED = "#253947"
+BG_SELECTED = "#123947"
+BG_SUCCESS = "#12372D"
+BG_WARNING = "#3B3219"
+BG_DANGER  = "#3D2025"
+BG_RED     = "#FF6B6B"
+BG_ADJ     = "#0B0D10"
+COL_TXT    = "#E8EDF2"
+COL_DIM    = "#97A1AD"
+COL_BLU    = "#2ED7FF"
+COL_YEL    = "#F2C14E"
+COL_GRN    = "#4FD18B"
+COL_RED    = "#FF6B6B"
+COL_PUR    = "#58C8F8"
 SETTING_LABEL_W = 18
+
+
+def _apply_dark_titlebar(window):
+    """Use the supported DWM dark-caption attribute when available.
+
+    Windows 10 builds used attribute 19 before attribute 20 became stable.
+    Both calls are deliberately best-effort so older Windows/Tk builds retain
+    the normal system title bar instead of failing application startup.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        window.update_idletasks()
+        child_hwnd = int(window.winfo_id())
+        parent_hwnd = ctypes.windll.user32.GetParent(child_hwnd)
+        hwnd = parent_hwnd or child_hwnd
+        enabled = ctypes.c_int(1)
+        dwm = ctypes.windll.dwmapi.DwmSetWindowAttribute
+        for attribute in (20, 19):
+            if dwm(hwnd, attribute, ctypes.byref(enabled), ctypes.sizeof(enabled)) == 0:
+                return True
+    except (AttributeError, OSError, tk.TclError, ValueError):
+        pass
+    return False
 
 # AUTO強度モードの表示色(操作バーの⚡AUTOボタンはテキスト固定・色でモードを示す)
 RT_MODE_COLORS = {
@@ -123,6 +172,16 @@ RT_MODE_COLORS = {
     "標準":         COL_GRN,
     "見やすさ優先": COL_YEL,
     "極暗":         COL_PUR,
+}
+
+# 操作バーは狭幅でもA-Bなど隣接操作を圧迫しない短縮名を使う。
+# 設定値・メニュー・保存データでは従来の正式名を維持する。
+RT_MODE_TOOLBAR_LABELS = {
+    "OFF": "OFF",
+    "控えめ": "控えめ",
+    "標準": "標準",
+    "見やすさ優先": "見やすさ",
+    "極暗": "極暗",
 }
 
 # 用途別画質プリセット。詳細設定を知らなくても、画質と負荷の優先度を選べる。
@@ -155,7 +214,7 @@ class _ToolTip:
         self._tip.overrideredirect(True)
         self._tip.attributes("-topmost", True)
         self._tip.geometry(f"+{x}+{y}")
-        tk.Label(self._tip, text=self._text, bg="#2a2a2a", fg="#e0e0e0",
+        tk.Label(self._tip, text=self._text, bg=BG_BTN_H, fg=COL_TXT,
                  font=("Segoe UI", 8), padx=8, pady=4,
                  justify=tk.LEFT, relief=tk.SOLID, bd=1).pack()
 
@@ -272,8 +331,9 @@ class VideoPlayer:
     def __init__(self, root: TkinterDnD.Tk):
         self.root = root
         self.root.title("Lumveil")
-        self.root.configure(bg=BG_VIDEO)
+        self.root.configure(bg=BG_APP)
         self.root.minsize(720, 460)
+        self._init_ui_icons()
 
         # RT 自動調整（MPV整数空間で計算: 0=中立）
         self._rt_enabled  = False
@@ -331,6 +391,8 @@ class VideoPlayer:
         self._native_dialog_open = False
         self._fs_bar_visible  = False
         self._fs_hide_after_id = None
+        self._control_hide_after_id = None
+        self._controls_visible = True
         self._picture_mode = "標準"
         self._mode_btns    = {}
         self._rt_mode_btns = {}
@@ -341,6 +403,14 @@ class VideoPlayer:
         self._playlist      = []
         self._playlist_idx  = -1
         self._playlist_popup = None
+        self._quality_popup = None
+        self._auto_update_checks = False
+        self._last_update_check = 0.0
+        self._update_info = None
+        self._update_check_in_progress = False
+        self._volume_popup_after_id = None
+        self._preview_key = None
+        self._preview_pending_key = None
         # 再生設定（初期値は従来の挙動を維持）
         self._playback_eof_action = "next"   # next / stop
         self._resume_enabled      = True
@@ -355,13 +425,12 @@ class VideoPlayer:
         self._lbtn_prev    = False
         # 右側の操作バーは、よく使う項目だけを常時表示できる。
         # どの項目も「…」メニューから実行できるため、非表示にしても機能は失われない。
-        self._toolbar_default_visible = {
-            "speed", "playlist", "subtitles", "audio", "screenshot", "bookmark",
-            "auto_adjust", "fullscreen",
-        }
+        # v2.1-style immersive layout: keep only the most common secondary
+        # actions on the dock.  Everything else remains available in "...".
+        self._toolbar_default_visible = {"speed", "playlist", "fullscreen"}
         self._toolbar_visible = set(self._toolbar_default_visible)
         self._toolbar_order = [
-            "fullscreen", "auto_adjust", "speed", "playlist", "subtitles", "audio",
+            "fullscreen", "speed", "playlist", "auto_adjust", "quality", "subtitles", "audio",
             "screenshot", "bookmark", "pin", "recent", "ab_repeat", "gpu", "about",
         ]
         self._toolbar_items = {}
@@ -370,6 +439,7 @@ class VideoPlayer:
 
         self._build_ui()
         self.root.update()  # canvas を確実に実体化してから winfo_id を取得
+        _apply_dark_titlebar(self.root)
 
         # MPV プレイヤー（wid でキャンバスに埋め込み）
         mpv_kwargs = dict(
@@ -384,6 +454,9 @@ class VideoPlayer:
             mpv_kwargs["gpu_api"] = "d3d11"
         self.player = mpv.MPV(**mpv_kwargs)
         self.player.volume = 80
+        # mpv creates a native child window.  Raise the Tk overlays after it
+        # exists so the v2.0 header remains visible above the video surface.
+        self.root.after(250, self._raise_ui_overlays)
 
         # duration/pauseは変化頻度が低いため、毎ティックの問い合わせをやめて
         # mpv側からのプロパティ変化通知をキャッシュする方式に変更（負荷軽減）。
@@ -418,6 +491,7 @@ class VideoPlayer:
 
         self._build_adj_win()
         self._build_gpu_win()
+        self.root.after(2500, self._maybe_check_updates)
         self._bind_keys()
         self._setup_dnd()
         self._setup_video_click()
@@ -474,19 +548,32 @@ class VideoPlayer:
             self._resume_enabled = bool(data.get("resume_enabled", True))
             self._folder_end_action = data.get("folder_end_action", "stop")
             self._playlist_sort = data.get("playlist_sort", "name")
+            self._auto_update_checks = bool(data.get("auto_update_checks", False))
+            self._last_update_check = float(data.get("last_update_check", 0.0) or 0.0)
+            ui_layout_version = int(data.get("ui_layout_version", 1) or 1)
             saved_toolbar = data.get("toolbar_visible")
-            if isinstance(saved_toolbar, list):
+            if ui_layout_version >= 2 and isinstance(saved_toolbar, list):
                 valid = set(self._toolbar_item_definitions())
                 self._toolbar_visible = set(saved_toolbar) & valid
             saved_order = data.get("toolbar_order")
-            if isinstance(saved_order, list):
+            if ui_layout_version >= 2 and isinstance(saved_order, list):
                 valid = set(self._toolbar_order)
                 ordered = [key for key in saved_order if key in valid]
                 self._toolbar_order = ordered + [key for key in self._toolbar_order
                                                  if key not in ordered]
+            elif ui_layout_version < 2:
+                # One-time migration from the wide v1.x toolbar to the
+                # compact v2 layout.  Customization remains available after
+                # the new layout has been saved once.
+                self._toolbar_visible = set(self._toolbar_default_visible)
+                self._toolbar_order = [
+                    "fullscreen", "speed", "playlist", "auto_adjust", "quality",
+                    "subtitles", "audio", "screenshot", "bookmark", "pin",
+                    "recent", "ab_repeat", "gpu", "about",
+                ]
             if self._always_on_top:
                 self.root.attributes("-topmost", True)
-                self._pin_btn.config(fg=COL_GRN)
+                self._set_button_selected(self._pin_btn, True, "success")
             if self._toolbar_items:
                 self._refresh_toolbar()
         except Exception:
@@ -507,6 +594,9 @@ class VideoPlayer:
                     "resume_enabled": self._resume_enabled,
                     "folder_end_action": self._folder_end_action,
                     "playlist_sort": self._playlist_sort,
+                    "auto_update_checks": self._auto_update_checks,
+                    "last_update_check": self._last_update_check,
+                    "ui_layout_version": 2,
                 }, f, ensure_ascii=False)
         except Exception as e:
             self._set_settings_error("プレイヤー設定の保存", e)
@@ -514,7 +604,7 @@ class VideoPlayer:
     def _toggle_always_on_top(self):
         self._always_on_top = not self._always_on_top
         self.root.attributes("-topmost", self._always_on_top)
-        self._pin_btn.config(fg=COL_GRN if self._always_on_top else COL_TXT)
+        self._set_button_selected(self._pin_btn, self._always_on_top, "success")
         self._save_player_settings()
 
     # ── 続きから再生 ──────────────────────────────────────────────────────
@@ -571,16 +661,98 @@ class VideoPlayer:
 
     # ── ボタンヘルパー ────────────────────────────────────────────────────
 
+    def _init_ui_icons(self):
+        """Select one Windows-native icon family with a Unicode fallback."""
+        try:
+            families = set(tkfont.families(self.root))
+        except tk.TclError:
+            families = set()
+        icon_family = next((name for name in ("Segoe Fluent Icons", "Segoe MDL2 Assets")
+                            if name in families), None)
+        if icon_family:
+            self._icon_font_name = icon_family
+            # Segoe Fluent Icons and Segoe MDL2 Assets share these core glyphs.
+            self._icons = {
+                "open": "\ue8e5", "back": "\ue72b", "frame_back": "\ue892",
+                "play": "\ue768", "pause": "\ue769", "frame_forward": "\ue893",
+                "forward": "\ue72a", "stop": "\ue71a", "volume": "\ue767",
+                "mute": "\ue74f", "fullscreen": "\ue740", "pin": "\ue718",
+                "info": "\ue946", "recent": "\ue81c", "playlist": "\ue8fd",
+                "audio": "\ue8d6", "subtitles": "\ue7f0", "screenshot": "\ue722",
+                "bookmark": "\ue734", "more": "\ue712",
+            }
+        else:
+            self._icon_font_name = "Segoe UI Symbol"
+            self._icons = {
+                "open": "+", "back": "«", "frame_back": "‹", "play": "▶",
+                "pause": "Ⅱ", "frame_forward": "›", "forward": "»", "stop": "■",
+                "volume": "VOL", "mute": "MUTE", "fullscreen": "□", "pin": "PIN",
+                "info": "i", "recent": "↶", "playlist": "≡", "audio": "♪",
+                "subtitles": "CC", "screenshot": "SS", "bookmark": "◇", "more": "…",
+            }
+        self._icon_font = (self._icon_font_name, 12)
+
+    @staticmethod
+    def _button_is_enabled(button):
+        return str(button.cget("state")) != str(tk.DISABLED)
+
+    def _bind_button_states(self, button):
+        """Give every helper-created button the same hover/press behavior."""
+        def enter(_event):
+            if self._button_is_enabled(button):
+                button.config(bg=button._lumveil_hover_bg)
+
+        def leave(_event):
+            button.config(bg=button._lumveil_bg, fg=button._lumveil_fg)
+
+        def press(_event):
+            if self._button_is_enabled(button):
+                button.config(bg=BG_PRESSED)
+
+        def release(event):
+            if self._button_is_enabled(button):
+                inside = 0 <= event.x < button.winfo_width() and 0 <= event.y < button.winfo_height()
+                button.config(bg=button._lumveil_hover_bg if inside else button._lumveil_bg)
+
+        button.bind("<Enter>", enter)
+        button.bind("<Leave>", leave)
+        button.bind("<ButtonPress-1>", press, add="+")
+        button.bind("<ButtonRelease-1>", release, add="+")
+
+    def _set_button_visual(self, button, bg=None, fg=None, hover_bg=None):
+        """Update a persistent visual state without breaking hover restoration."""
+        button._lumveil_bg = bg or getattr(button, "_lumveil_neutral_bg", BG_BTN)
+        button._lumveil_fg = fg or getattr(button, "_lumveil_neutral_fg", COL_TXT)
+        button._lumveil_hover_bg = hover_bg or BG_BTN_H
+        button.config(bg=button._lumveil_bg, fg=button._lumveil_fg,
+                      activebackground=BG_PRESSED, activeforeground=COL_TXT)
+
+    def _set_button_selected(self, button, selected, tone="accent"):
+        palettes = {
+            "accent": (BG_SELECTED, COL_BLU),
+            "success": (BG_SUCCESS, COL_GRN),
+            "warning": (BG_WARNING, COL_YEL),
+            "danger": (BG_DANGER, COL_RED),
+        }
+        if selected:
+            bg, fg = palettes.get(tone, palettes["accent"])
+            self._set_button_visual(button, bg, fg)
+        else:
+            self._set_button_visual(button)
+
     def _btn(self, parent, text, cmd, fg=COL_TXT, bg=None,
              font=("Segoe UI", 11), pad=(8, 4), tooltip=None):
         bg = bg or BG_BTN
         b  = tk.Button(parent, text=text, command=cmd,
                        bg=bg, fg=fg, relief=tk.FLAT, bd=0,
                        font=font, padx=pad[0], pady=pad[1],
-                       cursor="hand2",
-                       activebackground=BG_BTN_H, activeforeground=COL_TXT)
-        b.bind("<Enter>", lambda e, b=b, abg=BG_BTN_H: b.config(bg=abg))
-        b.bind("<Leave>", lambda e, b=b, nbg=bg: b.config(bg=nbg))
+                       cursor="hand2", highlightthickness=0,
+                       disabledforeground=COL_DIM,
+                       activebackground=BG_PRESSED, activeforeground=COL_TXT)
+        b._lumveil_neutral_bg = bg
+        b._lumveil_neutral_fg = fg
+        self._set_button_visual(b, bg, fg)
+        self._bind_button_states(b)
         if tooltip:
             self._add_tooltip(b, tooltip)
         return b
@@ -592,10 +764,13 @@ class VideoPlayer:
         f.pack_propagate(False)
         b  = tk.Button(f, text=text, command=cmd,
                        bg=bg, fg=fg, relief=tk.FLAT, bd=0,
-                       font=font, cursor="hand2",
-                       activebackground=BG_BTN_H, activeforeground=COL_TXT)
-        b.bind("<Enter>", lambda e: b.config(bg=BG_BTN_H))
-        b.bind("<Leave>", lambda e: b.config(bg=bg))
+                       font=font, cursor="hand2", highlightthickness=0,
+                       disabledforeground=COL_DIM,
+                       activebackground=BG_PRESSED, activeforeground=COL_TXT)
+        b._lumveil_neutral_bg = bg
+        b._lumveil_neutral_fg = fg
+        self._set_button_visual(b, bg, fg)
+        self._bind_button_states(b)
         b.pack(fill=tk.BOTH, expand=True)
         if tooltip:
             self._add_tooltip(b, tooltip)
@@ -613,7 +788,7 @@ class VideoPlayer:
                 win.attributes("-topmost", True)
             except Exception:
                 pass
-            tk.Label(win, text=text, bg="#222222", fg=COL_TXT,
+            tk.Label(win, text=text, bg=BG_BTN_H, fg=COL_TXT,
                      font=("Segoe UI", 8), padx=6, pady=2).pack()
             x = widget.winfo_rootx() + widget.winfo_width() // 2 - 10
             y = widget.winfo_rooty() - 24
@@ -635,22 +810,26 @@ class VideoPlayer:
         widget.bind("<Button-1>", on_leave, add="+")
 
     def _sep(self, parent):
-        tk.Frame(parent, bg="#333333", width=1).pack(
+        tk.Frame(parent, bg=BG_BORDER, width=1).pack(
             side=tk.LEFT, fill=tk.Y, padx=6, pady=6)
 
     # ── UI構築 ────────────────────────────────────────────────────────────
 
     def _build_ui(self):
+        # The video surface owns the whole client area.  All controls are
+        # transient overlays; no content header reserves pixels above it.
         self.video_canvas = tk.Canvas(self.root, bg=BG_VIDEO,
                                       highlightthickness=0)
         self.video_canvas.pack(fill=tk.BOTH, expand=True)
 
-        self.ctrl_bar = tk.Frame(self.root, bg=BG_CTRL)
+        self.ctrl_bar = tk.Frame(self.root, bg=BG_CTRL,
+                                 highlightbackground=BG_BORDER,
+                                 highlightthickness=1)
         self.ctrl_bar.pack(fill=tk.X, side=tk.BOTTOM)
-        tk.Frame(self.ctrl_bar, bg="#282828", height=1).pack(fill=tk.X)
+        tk.Frame(self.ctrl_bar, bg=COL_BLU, height=1).pack(fill=tk.X, padx=18)
 
         seek_row = tk.Frame(self.ctrl_bar, bg=BG_CTRL)
-        seek_row.pack(fill=tk.X, padx=12, pady=(6, 2))
+        seek_row.pack(fill=tk.X, padx=18, pady=(6, 1))
 
         self.time_var = tk.StringVar(value="0:00:00")
         tk.Label(seek_row, textvariable=self.time_var,
@@ -673,134 +852,169 @@ class VideoPlayer:
                  font=("Consolas", 9), width=7).pack(side=tk.LEFT)
 
         btn_row = tk.Frame(self.ctrl_bar, bg=BG_CTRL)
-        btn_row.pack(fill=tk.X, padx=6, pady=(0, 6))
+        btn_row.pack(fill=tk.X, padx=12, pady=(1, 7))
         self._btn_row = btn_row
 
-        f, _ = self._fixed_btn(btn_row, "⊕", self.open_file, w=30,
-                               font=("Segoe UI", 10), tooltip="ファイルを開く")
-        f.pack(side=tk.LEFT, padx=1)
-        self._sep(btn_row)
+        # Primary playback controls stay in a single flat row.  Secondary
+        # features are kept in the compact right-side menu below.
+        playback = tk.Frame(btn_row, bg=BG_CTRL, padx=1, pady=1)
+        playback.pack(side=tk.LEFT)
+        self._playback_group = playback
 
-        f, _ = self._fixed_btn(btn_row, "⏮", self.seek_backward, w=32,
-                               font=("Segoe UI", 13), tooltip="5秒戻る")
+        f, _ = self._fixed_btn(playback, self._icons["open"], self.open_file, w=34, h=32,
+                               font=self._icon_font, tooltip="ファイルを開く")
         f.pack(side=tk.LEFT, padx=1)
-        f, _ = self._fixed_btn(btn_row, "⏴", self.frame_backward, w=30,
-                               font=("Segoe UI", 11), tooltip="1コマ戻る")
+        self._sep(playback)
+
+        f, _ = self._fixed_btn(playback, self._icons["back"], self.seek_backward, w=34, h=32,
+                               font=self._icon_font, tooltip="5秒戻る")
+        f.pack(side=tk.LEFT, padx=1)
+        f, _ = self._fixed_btn(playback, self._icons["frame_back"], self.frame_backward, w=32, h=32,
+                               font=self._icon_font, tooltip="1コマ戻る")
         f.pack(side=tk.LEFT, padx=1)
 
-        _pf, self.play_btn = self._fixed_btn(btn_row, "▶", self.toggle_play,
-                                             w=42, font=("Segoe UI", 16),
+        _pf, self.play_btn = self._fixed_btn(playback, self._icons["play"], self.toggle_play,
+                                             w=32, h=30, fg=COL_BLU, bg=BG_BTN,
+                                             font=(self._icon_font_name, 12),
                                              tooltip="再生 / 一時停止")
-        _pf.pack(side=tk.LEFT, padx=2)
+        _pf.pack(side=tk.LEFT, padx=1)
+        self.play_btn._lumveil_neutral_bg = BG_BTN
+        self.play_btn._lumveil_neutral_fg = COL_BLU
+        self._set_button_visual(self.play_btn, BG_BTN, COL_BLU, hover_bg=BG_BTN_H)
 
-        f, _ = self._fixed_btn(btn_row, "⏵", self.frame_forward, w=30,
-                               font=("Segoe UI", 11), tooltip="1コマ進む")
+        f, _ = self._fixed_btn(playback, self._icons["frame_forward"], self.frame_forward, w=32, h=32,
+                               font=self._icon_font, tooltip="1コマ進む")
         f.pack(side=tk.LEFT, padx=1)
-        f, _ = self._fixed_btn(btn_row, "⏭", self.seek_forward, w=32,
-                               font=("Segoe UI", 13), tooltip="5秒進む")
+        f, _ = self._fixed_btn(playback, self._icons["forward"], self.seek_forward, w=34, h=32,
+                               font=self._icon_font, tooltip="5秒進む")
         f.pack(side=tk.LEFT, padx=1)
-        f, _ = self._fixed_btn(btn_row, "⏹", self.stop, w=30,
-                               font=("Segoe UI", 11), tooltip="停止")
+        f, _ = self._fixed_btn(playback, self._icons["stop"], self.stop, w=32, h=32,
+                               font=self._icon_font, tooltip="停止")
         f.pack(side=tk.LEFT, padx=1)
 
-        self._sep(btn_row)
+        viewing = tk.Frame(btn_row, bg=BG_CTRL, highlightbackground=BG_BORDER,
+                           highlightthickness=0, padx=1, pady=1)
+        viewing.pack(side=tk.LEFT, padx=(8, 0))
+        self._viewing_group = viewing
 
-        _mf, self._mute_btn = self._fixed_btn(btn_row, "🔊", self._toggle_volume_popup,
-                                              w=32, font=("Segoe UI", 12),
+        _mf, self._mute_btn = self._fixed_btn(viewing, self._icons["volume"], self._toggle_volume_popup,
+                                              w=34, h=32, font=self._icon_font,
                                               tooltip="音量（右クリックでミュート）")
-        _mf.pack(side=tk.LEFT)
+        _mf.pack(side=tk.LEFT, padx=1)
         self._mute_btn.bind("<Button-3>", lambda _e: self.toggle_mute())
         self._volume_popup = None
 
         self.vol_var = tk.IntVar(value=80)
         self._vol_pending = False
 
-        self._time_btn_var = tk.StringVar(value="0:00:00 / 0:00:00")
-        tk.Label(btn_row, textvariable=self._time_btn_var,
-                 bg=BG_CTRL, fg=COL_DIM,
-                 font=("Consolas", 9)).pack(side=tk.LEFT, padx=4)
-
-        self._toolbar_right = tk.Frame(btn_row, bg=BG_CTRL)
+        self._toolbar_right = tk.Frame(btn_row, bg=BG_CTRL,
+                                       highlightbackground=BG_BORDER, highlightthickness=0,
+                                       padx=1, pady=1)
         self._toolbar_right.pack(side=tk.RIGHT)
         btn_row.bind("<Configure>", self._on_toolbar_resize)
         right = self._toolbar_right
 
-        f, self._fs_btn = self._fixed_btn(right, "⛶", self.toggle_fullscreen,
-                                          w=30, font=("Segoe UI", 12), tooltip="全画面表示")
+        f, self._fs_btn = self._fixed_btn(right, self._icons["fullscreen"], self.toggle_fullscreen,
+                                          w=32, h=32, font=self._icon_font, tooltip="全画面表示")
         self._toolbar_items["fullscreen"] = f
-        f, self._pin_btn = self._fixed_btn(right, "📌", self._toggle_always_on_top,
-                                           w=30, font=("Segoe UI", 11), tooltip="常に手前に表示 (T)")
+        f, self._pin_btn = self._fixed_btn(right, self._icons["pin"], self._toggle_always_on_top,
+                                           w=32, h=32, font=self._icon_font, tooltip="常に手前に表示 (T)")
         self._toolbar_items["pin"] = f
-        f, _ = self._fixed_btn(right, "ⓘ", self._show_about, w=24,
-                               font=("Segoe UI", 9), tooltip="Lumveilについて")
+        f, _ = self._fixed_btn(right, self._icons["info"], self._show_about, w=32, h=32,
+                               font=self._icon_font, tooltip="Lumveilについて")
         self._toolbar_items["about"] = f
-        f, self._auto_btn = self._fixed_btn(right, "⚡ AUTO", self._show_auto_menu,
-                                            w=66, font=("Segoe UI", 9), tooltip="暗闇補正(自動)の強度を選択")
+        f, self._auto_btn = self._fixed_btn(right, "AUTO · OFF", self._show_auto_menu,
+                                            w=96, h=32, font=("Segoe UI", 9, "bold"),
+                                            tooltip="暗闇補正(自動)の強度を選択")
+        self._auto_frame = f
         self._toolbar_items["auto_adjust"] = f
+        f, self._quality_button = self._fixed_btn(
+            right, "画質", self._toggle_quality_quick_panel,
+            w=44, h=32, font=("Segoe UI", 9, "bold"), tooltip="画質クイックパネル")
+        self._quality_frame = f
+        self._toolbar_items["quality"] = f
         self._settings_btn, self._settings_button = self._fixed_btn(
-            right, "⚙ 設定", self._toggle_adj_win,
-            w=58, font=("Segoe UI", 9), tooltip="設定を開く")
-        f, _ = self._fixed_btn(right, "⚙ GPU", self._toggle_gpu_win, w=54,
-                               font=("Segoe UI", 9), tooltip="GPU/シェーダー設定")
+            right, "設定", self._toggle_adj_win,
+            w=50, h=32, font=("Segoe UI", 9), tooltip="設定を開く")
+        f, _ = self._fixed_btn(right, "GPU", self._toggle_gpu_win, w=42, h=32,
+                               font=("Segoe UI", 9, "bold"), tooltip="GPU/シェーダー設定")
         self._toolbar_items["gpu"] = f
-        f, _ = self._fixed_btn(right, "🕘", self._show_recent_menu, w=30,
-                               font=("Segoe UI", 11), tooltip="最近開いたファイル")
+        f, _ = self._fixed_btn(right, self._icons["recent"], self._show_recent_menu, w=32, h=32,
+                               font=self._icon_font, tooltip="最近開いたファイル")
         self._toolbar_items["recent"] = f
-        f, _ = self._fixed_btn(right, "☷", self._show_playlist, w=30,
-                               font=("Segoe UI", 13), tooltip="再生リスト")
+        f, _ = self._fixed_btn(right, self._icons["playlist"], self._show_playlist, w=32, h=32,
+                               font=self._icon_font, tooltip="再生リスト")
         self._toolbar_items["playlist"] = f
-        f, _ = self._fixed_btn(right, "🎵", lambda: self._show_track_menu("audio"), w=30,
-                               font=("Segoe UI", 11), tooltip="音声トラック")
+        f, _ = self._fixed_btn(right, self._icons["audio"], lambda: self._show_track_menu("audio"), w=32, h=32,
+                               font=self._icon_font, tooltip="音声トラック")
         self._toolbar_items["audio"] = f
-        f, _ = self._fixed_btn(right, "💬", lambda: self._show_track_menu("sub"), w=30,
-                               font=("Segoe UI", 11), tooltip="字幕トラック")
+        f, _ = self._fixed_btn(right, self._icons["subtitles"], lambda: self._show_track_menu("sub"), w=32, h=32,
+                               font=self._icon_font, tooltip="字幕トラック")
         self._toolbar_items["subtitles"] = f
-        f, self._ab_btn = self._fixed_btn(right, "A-B", self._toggle_ab_loop, w=34,
+        f, self._ab_btn = self._fixed_btn(right, "A-B", self._toggle_ab_loop, w=50, h=32,
                                           font=("Segoe UI", 9), tooltip="A-Bリピート")
         self._toolbar_items["ab_repeat"] = f
-        f, self._shot_btn = self._fixed_btn(right, "SS", self._take_screenshot, w=30,
-                                            font=("Consolas", 9, "bold"), tooltip="スクリーンショット")
+        f, self._shot_btn = self._fixed_btn(right, self._icons["screenshot"], self._take_screenshot, w=32, h=32,
+                                            font=self._icon_font, tooltip="スクリーンショット")
         self._shot_btn.bind("<Button-3>", self._show_shot_menu)
         self._toolbar_items["screenshot"] = f
-        f, _ = self._fixed_btn(right, "🔖", self._show_bookmark_menu, w=30,
-                               font=("Segoe UI", 11), tooltip="ブックマーク")
+        f, _ = self._fixed_btn(right, self._icons["bookmark"], self._show_bookmark_menu, w=32, h=32,
+                               font=self._icon_font, tooltip="ブックマーク")
         self._toolbar_items["bookmark"] = f
 
         # 速度は数値ボタンに集約し、クリックで一覧から選ぶ。
-        spd = tk.Frame(right, bg=BG_CTRL, width=50, height=28)
+        spd = tk.Frame(right, bg=BG_CTRL, width=52, height=32)
         spd.pack_propagate(False)
         self._speed_var = tk.StringVar(value="1.00×")
         self._speed_btn = tk.Button(spd, textvariable=self._speed_var,
                                     command=self._show_speed_menu,
                                     bg=BG_CTRL, fg=COL_BLU, relief=tk.FLAT, bd=0,
                                     font=("Consolas", 9), cursor="hand2",
-                                    activebackground=BG_BTN_H, activeforeground=COL_TXT)
+                                    highlightthickness=0, disabledforeground=COL_DIM,
+                                    activebackground=BG_PRESSED, activeforeground=COL_TXT)
+        self._speed_btn._lumveil_neutral_bg = BG_CTRL
+        self._speed_btn._lumveil_neutral_fg = COL_BLU
+        self._set_button_visual(self._speed_btn, BG_CTRL, COL_BLU)
+        self._bind_button_states(self._speed_btn)
         self._speed_btn.pack(fill=tk.BOTH, expand=True)
         self._add_tooltip(self._speed_btn, "再生速度を選択")
         self._toolbar_items["speed"] = spd
 
-        self._more_btn = self._btn(right, "⋯", self._show_toolbar_menu,
+        self._more_btn = self._btn(right, self._icons["more"], self._show_toolbar_menu,
                                    tooltip="その他の操作",
-                                   font=("Segoe UI", 14), pad=(7, 1))
+                                   font=self._icon_font, pad=(9, 5))
         self._refresh_toolbar()
 
         style = ttk.Style()
         style.theme_use("clam")
         style.configure("Horizontal.TScale",
-                        background=BG_CTRL, troughcolor="#333333",
-                        sliderlength=14, sliderrelief=tk.FLAT)
-        style.configure("Adj.Horizontal.TScale",
-                        background=BG_ADJ, troughcolor="#333333",
+                        background=BG_CTRL, troughcolor=BG_BORDER,
                         sliderlength=12, sliderrelief=tk.FLAT)
-        style.configure("Lumveil.TNotebook", background=BG_ADJ, borderwidth=0)
-        style.configure("Lumveil.TNotebook.Tab", background=BG_BTN, foreground=COL_TXT,
-                        padding=(11, 6), font=("Segoe UI", 10))
+        style.configure("Adj.Horizontal.TScale",
+                        background=BG_CTRL, troughcolor=BG_BORDER,
+                        sliderlength=12, sliderrelief=tk.FLAT)
+        style.configure("Lumveil.TNotebook", background=BG_APP, borderwidth=0)
+        style.configure("Lumveil.TNotebook.Tab", background=BG_APP, foreground=COL_DIM,
+                        padding=(16, 9), font=("Segoe UI", 9))
         style.map("Lumveil.TNotebook.Tab",
-                  background=[("selected", BG_BTN_H)], foreground=[("selected", COL_BLU)])
+                  background=[("selected", BG_CTRL), ("active", BG_BTN_H)],
+                  foreground=[("selected", COL_BLU), ("active", COL_TXT)])
+        try:
+            # The tab strip is rendered by the custom v2 tab bar below.
+            style.layout("Lumveil.TNotebook",
+                         [("Notebook.client", {"sticky": "nswe"})])
+            style.layout("Lumveil.TNotebook.Tab", [])
+        except tk.TclError:
+            pass
 
         self.prev_popup = tk.Toplevel(self.root)
         self.prev_popup.overrideredirect(True)
         self.prev_popup.withdraw()
+        # mpv owns a native child window; keep the seek preview above it.
+        try:
+            self.prev_popup.attributes("-topmost", True)
+        except tk.TclError:
+            pass
         self.prev_popup.configure(bg="#000000")
         self.prev_img_label = tk.Label(self.prev_popup, bg="black",
                                        bd=1, relief=tk.SOLID)
@@ -808,6 +1022,13 @@ class VideoPlayer:
         self.prev_time_label = tk.Label(self.prev_popup, bg="black", fg="white",
                                         font=("Consolas", 8), pady=2)
         self.prev_time_label.pack()
+
+    def _raise_ui_overlays(self):
+        """Keep the v2.0 Tk overlays above mpv's native child window."""
+        try:
+            self.ctrl_bar.lift()
+        except tk.TclError:
+            pass
 
     # ── 操作バーの表示設定 ────────────────────────────────────────────────
 
@@ -818,6 +1039,7 @@ class VideoPlayer:
             "pin":         ("常に手前に表示", self._toggle_always_on_top),
             "about":       ("Lumveilについて", self._show_about),
             "auto_adjust": ("暗闇補正（AUTO）", self._toggle_rt_adj),
+            "quality":     ("画質クイックパネル", self._toggle_quality_quick_panel),
             "settings":    ("設定", self._toggle_adj_win),
             "gpu":         ("GPU / シェーダー設定", self._toggle_gpu_win),
             "recent":      ("最近開いたファイル", self._show_recent_menu),
@@ -835,10 +1057,11 @@ class VideoPlayer:
             return
         for frame in self._toolbar_items.values():
             frame.pack_forget()
+        # The former three-dot button is intentionally not packed.  Secondary
+        # actions are available from the video context menu.
         self._more_btn.pack_forget()
         # side=RIGHT のため、表示順の逆から詰めて左→右の順序を保つ。
         self._settings_btn.pack_forget()
-        self._more_btn.pack(side=tk.RIGHT, padx=(4, 1))
         self._settings_btn.pack(side=tk.RIGHT, padx=1)
         for key in reversed(self._toolbar_order):
             if key in self._toolbar_visible and key not in self._toolbar_auto_hidden:
@@ -861,7 +1084,7 @@ class VideoPlayer:
             if child is not self._toolbar_right
         )
         available = max(0, self._btn_row.winfo_width() - left_width - 8)
-        fixed_width = self._settings_btn.winfo_reqwidth() + self._more_btn.winfo_reqwidth() + 8
+        fixed_width = self._settings_btn.winfo_reqwidth() + 8
         visible_keys = [key for key in self._toolbar_order if key in self._toolbar_visible]
         remaining = fixed_width + sum(self._toolbar_items[key].winfo_reqwidth() + 2
                                       for key in visible_keys)
@@ -885,6 +1108,7 @@ class VideoPlayer:
         self._save_player_settings()
 
     def _show_toolbar_settings(self):
+        self._close_quality_quick_panel()
         self._settings_tabs.select(self._advanced_tab)
         if not self._settings_win.winfo_viewable():
             x = self.root.winfo_rootx() + 20
@@ -902,25 +1126,30 @@ class VideoPlayer:
         for key in self._toolbar_order:
             if key in self._toolbar_visible:
                 icon = self._toolbar_icons[key]
+                icon_font = (self._icon_font if key in {
+                    "fullscreen", "pin", "about", "recent", "playlist", "audio",
+                    "subtitles", "screenshot", "bookmark"
+                } else ("Segoe UI", 10))
                 item = tk.Label(self._toolbar_preview, text=icon, bg=BG_BTN, fg=COL_TXT,
-                                font=("Segoe UI", 11), padx=7, pady=4, cursor="fleur")
+                                font=icon_font, padx=7, pady=4, cursor="fleur")
                 item.pack(side=tk.LEFT, padx=1)
                 item.bind("<ButtonPress-1>", lambda e, k=key: self._toolbar_preview_drag_start(e, k))
                 item.bind("<B1-Motion>", self._toolbar_preview_drag_motion)
                 item.bind("<ButtonRelease-1>", self._toolbar_drag_end)
                 self._toolbar_preview_items[key] = item
         # side=RIGHT は先にpackしたものが最右端になる。
-        tk.Label(self._toolbar_preview, text="⋯", bg="#2a2a2a", fg=COL_TXT,
-                 font=("Segoe UI", 13), padx=7, pady=2).pack(side=tk.RIGHT, padx=1)
-        tk.Label(self._toolbar_preview, text="⚙ 設定", bg="#2a2a2a", fg=COL_TXT,
+        tk.Label(self._toolbar_preview, text=self._icons["more"], bg=BG_BTN_H, fg=COL_TXT,
+                 font=self._icon_font, padx=7, pady=4).pack(side=tk.RIGHT, padx=1)
+        tk.Label(self._toolbar_preview, text="設定", bg=BG_BTN_H, fg=COL_TXT,
                  font=("Segoe UI", 9), padx=7, pady=5).pack(side=tk.RIGHT, padx=1)
 
         for key, row in getattr(self, "_toolbar_rows", {}).items():
             active = key == getattr(self, "_toolbar_drag_target", None)
-            row.config(bg="#2a4a6a" if active else BG_ADJ)
+            surface = self._settings_surface(row.master)
+            row.config(bg=BG_SELECTED if active else surface)
             for child in row.winfo_children():
                 if isinstance(child, tk.Label):
-                    child.config(bg="#2a4a6a" if active else BG_ADJ)
+                    child.config(bg=BG_SELECTED if active else surface)
 
     def _toolbar_drag_start(self, event, key):
         self._toolbar_drag_key = key
@@ -978,12 +1207,60 @@ class VideoPlayer:
         else:
             self._refresh_toolbar_settings()
 
-    def _show_toolbar_menu(self):
+    def _on_right_click(self, event):
+        """Open the secondary-action list from the video surface."""
+        if self.root.attributes("-fullscreen"):
+            self._show_fullscreen_bar()
+            return "break"
+        px, py = event.x_root, event.y_root
+        cx = self.video_canvas.winfo_rootx()
+        cy = self.video_canvas.winfo_rooty()
+        cw = self.video_canvas.winfo_width()
+        ch = self.video_canvas.winfo_height()
+        if not (cx <= px <= cx + cw and cy <= py <= cy + ch):
+            return
+        if self._pos_blocked_by_subwindow(px, py):
+            return
+        return self._show_context_menu(event)
+
+    def _show_context_menu(self, event=None):
+        menu = tk.Menu(self.root, tearoff=False, bg=BG_ADJ, fg=COL_TXT,
+                       activebackground=BG_BTN_H, activeforeground=COL_TXT,
+                       font=("Segoe UI", 9))
+        menu.add_command(label="Play / Pause", command=self.toggle_play)
+        menu.add_command(label="Mute", command=self.toggle_mute)
+        menu.add_separator()
+        secondary = tk.Menu(menu, tearoff=False, bg=BG_ADJ, fg=COL_TXT,
+                            activebackground=BG_BTN_H, activeforeground=COL_TXT,
+                            font=("Segoe UI", 9))
+        self._populate_secondary_menu(secondary)
+        menu.add_cascade(label="Other", menu=secondary)
+        try:
+            x = event.x_root if event else self.root.winfo_pointerx()
+            y = event.y_root if event else self.root.winfo_pointery()
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
+    def _populate_secondary_menu(self, menu):
+        definitions = self._toolbar_item_definitions()
+        for key in ("fullscreen", "pin", "auto_adjust", "quality", "settings", "gpu",
+                    "recent", "playlist", "subtitles", "audio", "ab_repeat",
+                    "screenshot", "bookmark", "about"):
+            label, command = definitions[key]
+            menu.add_command(label=label, command=command)
+        menu.add_separator()
+        menu.add_command(label="Playback speed", command=self._show_speed_menu)
+        menu.add_command(label="Screenshot options", command=self._show_shot_menu)
+        menu.add_separator()
+        menu.add_command(label="Customize toolbar", command=self._show_toolbar_settings)
+
+    def _show_toolbar_menu(self, event=None):
         menu = tk.Menu(self.root, tearoff=False, bg=BG_ADJ, fg=COL_TXT,
                        activebackground=BG_BTN_H, activeforeground=COL_TXT,
                        font=("Segoe UI", 9))
         definitions = self._toolbar_item_definitions()
-        for key in ("fullscreen", "pin", "auto_adjust", "settings", "gpu", "recent", "playlist",
+        for key in ("fullscreen", "pin", "auto_adjust", "quality", "settings", "gpu", "recent", "playlist",
                     "subtitles", "audio", "ab_repeat", "screenshot", "bookmark", "about"):
             label, command = definitions[key]
             menu.add_command(label=label, command=command)
@@ -994,10 +1271,168 @@ class VideoPlayer:
 
         menu.add_command(label="操作バーを設定…", command=self._show_toolbar_settings)
         try:
-            menu.tk_popup(self._more_btn.winfo_rootx(),
-                          self._more_btn.winfo_rooty() + self._more_btn.winfo_height())
+            x = event.x_root if event else self.root.winfo_pointerx()
+            y = event.y_root if event else self.root.winfo_pointery()
+            menu.tk_popup(x, y)
         finally:
             menu.grab_release()
+
+    # ── 画質クイックパネル ──────────────────────────────────────────────
+
+    def _close_quality_quick_panel(self):
+        if self._quality_popup and self._quality_popup.winfo_exists():
+            self._quality_popup.destroy()
+        self._quality_popup = None
+        if hasattr(self, "_quality_button"):
+            self._set_button_selected(self._quality_button, False)
+
+    def _toggle_quality_quick_panel(self):
+        if self._quality_popup and self._quality_popup.winfo_exists():
+            self._close_quality_quick_panel()
+            return
+
+        win = tk.Toplevel(self.root)
+        self._quality_popup = win
+        win.overrideredirect(True)
+        win.configure(bg=BG_APP, highlightbackground=BG_BORDER, highlightthickness=1)
+        win.transient(self.root)
+        # overrideredirectウィンドウが親の背面へ回るのを防ぐため、表示直後だけ
+        # topmostを使って前面化し、整列後すぐ通常のowned windowへ戻す。
+        try:
+            win.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        self._set_button_selected(self._quality_button, True, "accent")
+        self._render_quality_quick_panel(reposition=True)
+        win.bind("<Escape>", lambda _e: self._close_quality_quick_panel())
+        win.lift(self.root)
+        win.after_idle(self._raise_quality_quick_panel)
+
+    def _raise_quality_quick_panel(self):
+        win = self._quality_popup
+        if not (win and win.winfo_exists()):
+            return
+        try:
+            win.attributes("-topmost", False)
+        except tk.TclError:
+            pass
+        win.lift(self.root)
+        win.focus_force()
+
+    def _start_quality_panel_drag(self, event):
+        win = self._quality_popup
+        if not (win and win.winfo_exists()):
+            return
+        self._quality_drag_offset = (
+            event.x_root - win.winfo_x(), event.y_root - win.winfo_y())
+        win.lift(self.root)
+
+    def _drag_quality_panel(self, event):
+        win = self._quality_popup
+        if not (win and win.winfo_exists()):
+            return
+        offset_x, offset_y = getattr(self, "_quality_drag_offset", (0, 0))
+        x = event.x_root - offset_x
+        y = event.y_root - offset_y
+        width = max(win.winfo_width(), win.winfo_reqwidth())
+        height = max(win.winfo_height(), win.winfo_reqheight())
+        x = max(8, min(x, win.winfo_screenwidth() - width - 8))
+        y = max(8, min(y, win.winfo_screenheight() - height - 8))
+        win.geometry(f"+{x}+{y}")
+
+    def _position_quality_quick_panel(self):
+        win = self._quality_popup
+        if not (win and win.winfo_exists()):
+            return
+        win.update_idletasks()
+        req_w, req_h = win.winfo_reqwidth(), win.winfo_reqheight()
+        anchor = self._quality_button
+        if anchor.winfo_ismapped():
+            x = anchor.winfo_rootx() + anchor.winfo_width() - req_w
+            y = anchor.winfo_rooty() - req_h - 6
+            if y < 8:
+                y = anchor.winfo_rooty() + anchor.winfo_height() + 6
+        else:
+            x = self.root.winfo_pointerx() - req_w // 2
+            y = self.root.winfo_rooty() + self.root.winfo_height() - req_h - 8
+        x = max(8, min(x, win.winfo_screenwidth() - req_w - 8))
+        y = max(8, min(y, win.winfo_screenheight() - req_h - 8))
+        win.geometry(f"+{x}+{y}")
+
+    def _render_quality_quick_panel(self, *, reposition=False):
+        win = self._quality_popup
+        if not (win and win.winfo_exists()):
+            return
+        for child in win.winfo_children():
+            child.destroy()
+
+        head = tk.Frame(win, bg=BG_APP, cursor="fleur")
+        head.pack(fill=tk.X, padx=12, pady=(10, 5))
+        title_label = tk.Label(head, text="画質", bg=BG_APP, fg=COL_TXT,
+                               font=("Segoe UI", 12, "bold"), cursor="fleur")
+        title_label.pack(side=tk.LEFT)
+        for drag_handle in (head, title_label):
+            drag_handle.bind("<ButtonPress-1>", self._start_quality_panel_drag)
+            drag_handle.bind("<B1-Motion>", self._drag_quality_panel)
+        close_btn = self._btn(head, "×", self._close_quality_quick_panel,
+                              bg=BG_APP, font=("Segoe UI", 12), pad=(8, 1),
+                              tooltip="閉じる")
+        close_btn.pack(side=tk.RIGHT)
+
+        card = self._settings_card(win, padx=8, pady=(0, 8))
+        surface = self._settings_surface(card)
+        self._settings_section_heading(card, "用途別プリセット")
+        preset_row = tk.Frame(card, bg=surface)
+        preset_row.pack(fill=tk.X, padx=10, pady=(0, 8))
+        for name in QUALITY_PRESETS:
+            button = self._btn(
+                preset_row, name,
+                lambda value=name: self._apply_quality_from_panel(value),
+                bg=surface, font=("Segoe UI", 9), pad=(7, 4))
+            button.pack(side=tk.LEFT, padx=2)
+            self._set_button_selected(button, name == self._quality_preset, "accent")
+
+        tk.Frame(card, bg=BG_BORDER, height=1).pack(fill=tk.X, padx=10)
+        current_auto = self._rt_mode if self._rt_enabled else "OFF"
+        self._settings_section_heading(card, "暗闇補正", f"現在: {current_auto}")
+        auto_row = tk.Frame(card, bg=surface)
+        auto_row.pack(fill=tk.X, padx=10, pady=(0, 8))
+        for name in ["OFF"] + list(RT_MODES.keys()):
+            button = self._btn(
+                auto_row, name,
+                lambda value=name: self._apply_auto_from_panel(value),
+                bg=surface, font=("Segoe UI", 9), pad=(7, 4))
+            button.pack(side=tk.LEFT, padx=2)
+            self._set_button_selected(button, name == current_auto, "accent")
+
+        foot = tk.Frame(card, bg=surface)
+        foot.pack(fill=tk.X, padx=10, pady=(2, 10))
+        self._btn(foot, "詳細設定を開く", self._open_settings_from_quality_panel,
+                  bg=surface, font=("Segoe UI", 9), pad=(10, 5)).pack(side=tk.LEFT)
+        self._btn(foot, "閉じる", self._close_quality_quick_panel,
+                  bg=surface, font=("Segoe UI", 9), pad=(10, 5)).pack(side=tk.RIGHT)
+        if reposition:
+            self._position_quality_quick_panel()
+
+    def _apply_quality_from_panel(self, name):
+        self._apply_quality_preset(name)
+        self._render_quality_quick_panel()
+
+    def _apply_auto_from_panel(self, name):
+        self._select_rt_mode(name)
+        # 動画未読込などでAUTOを開始できなかった場合も、実状態（OFF）へ即時同期する。
+        self._sync_rt_mode_buttons()
+        self._render_quality_quick_panel()
+
+    def _open_settings_from_quality_panel(self):
+        self._close_quality_quick_panel()
+        self._settings_tabs.select(self._quick_tab)
+        if not self._settings_win.winfo_viewable():
+            x = self.root.winfo_rootx() + 20
+            y = self.root.winfo_rooty() + 40
+            self._settings_win.geometry(f"+{x}+{y}")
+            self._settings_win.deiconify()
+        self._settings_win.lift()
 
     # ── 最近開いたファイル ──────────────────────────────────────────────
 
@@ -1057,6 +1492,7 @@ class VideoPlayer:
         win.geometry("500x360")
         win.minsize(360, 240)
         win.protocol("WM_DELETE_WINDOW", self._close_playlist_popup)
+        _apply_dark_titlebar(win)
 
         head = tk.Frame(win, bg=BG_ADJ)
         head.pack(fill=tk.X, padx=12, pady=(12, 6))
@@ -1070,7 +1506,7 @@ class VideoPlayer:
         body.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 8))
         scroll = tk.Scrollbar(body, orient=tk.VERTICAL)
         self._playlist_listbox = tk.Listbox(
-            body, bg="#1a1a1a", fg=COL_TXT, selectbackground="#2a4a6a",
+            body, bg=BG_CTRL, fg=COL_TXT, selectbackground=BG_SELECTED,
             selectforeground=COL_TXT, activestyle="none", relief=tk.FLAT, bd=0,
             font=("Segoe UI", 10), yscrollcommand=scroll.set)
         scroll.config(command=self._playlist_listbox.yview)
@@ -1226,7 +1662,7 @@ class VideoPlayer:
         self._menu_popup = win
         win.overrideredirect(True)
         win.configure(bg=BG_ADJ)
-        tk.Label(win, text=message, bg=BG_ADJ, fg="#ff6b6b",
+        tk.Label(win, text=message, bg=BG_ADJ, fg=COL_RED,
                  font=("Segoe UI", 9), justify="left",
                  wraplength=320, padx=14, pady=10).pack()
         self._btn(win, "閉じる", win.destroy,
@@ -1252,8 +1688,8 @@ class VideoPlayer:
             self._auto_adj_status.set(message)
 
     def _flash_shot_btn(self, text):
-        # 操作バー上の現在の表記（SS）へ戻す。旧UIの📷表記を残さない。
-        orig = "SS"
+        # 一時的な完了表示の後は、現在の統一アイコンへ戻す。
+        orig = self._icons["screenshot"]
         self._shot_btn.config(text=text)
         self.root.after(700, lambda: self._shot_btn.config(text=orig))
 
@@ -1385,57 +1821,309 @@ class VideoPlayer:
     # ── About ─────────────────────────────────────────────────────────────
 
     def _show_about(self):
-        win = tk.Toplevel(self.root)
-        self._about_win = win
-        win.title("About")
-        win.configure(bg=BG_ADJ)
-        win.resizable(False, False)
-        win.transient(self.root)
-        win.grab_set()
+        self._close_quality_quick_panel()
+        if hasattr(self, "_about_tab"):
+            self._settings_tabs.select(self._about_tab)
+        if not self._settings_win.winfo_viewable():
+            x = self.root.winfo_rootx() + 20
+            y = self.root.winfo_rooty() + 40
+            self._settings_win.geometry(f"+{x}+{y}")
+            self._settings_win.deiconify()
+        self._settings_win.lift()
 
-        # ウィンドウを親の中央に配置
-        win.update_idletasks()
-        pw, ph = self.root.winfo_width(), self.root.winfo_height()
-        px, py = self.root.winfo_rootx(), self.root.winfo_rooty()
-        w, h = 300, 180
-        win.geometry(f"{w}x{h}+{px + (pw - w)//2}+{py + (ph - h)//2}")
+    def _open_license_notices(self):
+        path = os.path.join(_SCRIPT_DIR, "THIRD_PARTY_NOTICES.md")
+        if not os.path.isfile(path):
+            if hasattr(self, "_update_status_var"):
+                self._update_status_var.set("THIRD_PARTY_NOTICES.md was not found.")
+            return
+        try:
+            os.startfile(path)
+        except Exception as exc:
+            if hasattr(self, "_update_status_var"):
+                self._update_status_var.set(f"Could not open license notices: {exc}")
 
-        tk.Label(win, text="Lumveil",
-                 bg=BG_ADJ, fg=COL_BLU,
-                 font=("Segoe UI", 20, "bold")).pack(pady=(24, 4))
-        tk.Label(win, text="ver. 1.8",
-                 bg=BG_ADJ, fg=COL_DIM,
-                 font=("Segoe UI", 9)).pack()
-        tk.Frame(win, bg="#333333", height=1).pack(fill=tk.X, padx=30, pady=14)
-        tk.Label(win, text="ふぁん",
-                 bg=BG_ADJ, fg=COL_TXT,
-                 font=("Segoe UI", 9)).pack()
-        self._btn(win, "閉じる", win.destroy,
-                  pad=(20, 5)).pack(pady=(16, 0))
+    @staticmethod
+    def _version_tuple(value):
+        match = re.search(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?", str(value))
+        if not match:
+            return (0, 0, 0)
+        return tuple(int(part or 0) for part in match.groups())
+
+    def _maybe_check_updates(self):
+        if (self._auto_update_checks and
+                time.time() - self._last_update_check >= UPDATE_CHECK_INTERVAL):
+            self._check_for_updates(manual=False)
+
+    def _toggle_auto_update_checks(self):
+        self._auto_update_checks = not self._auto_update_checks
+        if hasattr(self, "_auto_update_button"):
+            self._auto_update_button.config(text="ON" if self._auto_update_checks else "OFF")
+            self._style_toggle_button(self._auto_update_button, self._auto_update_checks)
+        self._save_player_settings()
+        if self._auto_update_checks:
+            self._check_for_updates(manual=False)
+
+    def _check_for_updates(self, manual=True):
+        if self._update_check_in_progress:
+            return
+        self._update_check_in_progress = True
+        if hasattr(self, "_update_status_var"):
+            self._update_status_var.set("Checking GitHub Releases...")
+        thread = threading.Thread(target=self._fetch_latest_release,
+                                  args=(manual,), daemon=True)
+        thread.start()
+
+    def _fetch_latest_release(self, manual):
+        error = None
+        info = None
+        try:
+            request = urllib.request.Request(
+                f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+                headers={"Accept": "application/vnd.github+json",
+                         "User-Agent": f"Lumveil/{APP_VERSION}"})
+            with urllib.request.urlopen(request, timeout=12) as response:
+                release = json.loads(response.read().decode("utf-8"))
+            assets = release.get("assets") or []
+            installers = [asset for asset in assets
+                          if str(asset.get("name", "")).lower().endswith(".exe")
+                          and any(word in str(asset.get("name", "")).lower()
+                                  for word in ("setup", "installer"))]
+            installer = installers[0] if installers else None
+            info = {
+                "version": str(release.get("tag_name") or release.get("name") or ""),
+                "release_url": str(release.get("html_url") or GITHUB_URL + "/releases"),
+                "asset_name": str(installer.get("name")) if installer else "",
+                "asset_url": str(installer.get("browser_download_url")) if installer else "",
+                "digest": str(installer.get("digest") or "") if installer else "",
+            }
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError,
+                OSError, ValueError) as exc:
+            error = str(exc)
+        try:
+            self.root.after(0, lambda: self._finish_update_check(info, error, manual))
+        except tk.TclError:
+            pass
+
+    def _finish_update_check(self, info, error, manual):
+        self._update_check_in_progress = False
+        self._last_update_check = time.time()
+        self._save_player_settings()
+        if error:
+            if hasattr(self, "_update_status_var"):
+                prefix = "Update check failed" if manual else "Automatic update check failed"
+                self._update_status_var.set(f"{prefix}: {error}")
+            return
+        if not info or self._version_tuple(info["version"]) <= self._version_tuple(APP_VERSION):
+            self._update_info = None
+            if hasattr(self, "_update_status_var"):
+                self._update_status_var.set(f"Lumveil v{APP_VERSION} is up to date.")
+            if hasattr(self, "_update_download_button"):
+                self._update_download_button.config(state=tk.DISABLED)
+            return
+        self._update_info = info
+        verified_asset = bool(info["asset_url"] and info["digest"].startswith("sha256:"))
+        if not info["asset_name"]:
+            installer_note = "Installer asset is not available yet."
+        elif not verified_asset:
+            installer_note = "Installer SHA-256 is not available; automatic installation is disabled."
+        else:
+            installer_note = info["asset_name"]
+        if hasattr(self, "_update_status_var"):
+            self._update_status_var.set(
+                f"New version {info['version']} is available.\n{installer_note}")
+        if hasattr(self, "_update_download_button"):
+            self._update_download_button.config(
+                state=tk.NORMAL if verified_asset else tk.DISABLED)
+
+    def _download_update(self):
+        info = self._update_info
+        if not info or not info.get("asset_url"):
+            if info:
+                webbrowser.open(info.get("release_url", GITHUB_URL + "/releases"))
+            return
+        if not messagebox.askyesno(
+                "Lumveil Update",
+                f"Download {info['asset_name']} and prepare installation?",
+                parent=self._settings_win):
+            return
+        self._update_download_button.config(state=tk.DISABLED)
+        self._update_status_var.set("Downloading update...")
+        threading.Thread(target=self._download_update_worker,
+                         args=(dict(info),), daemon=True).start()
+
+    def _download_update_worker(self, info):
+        path = None
+        error = None
+        try:
+            target_dir = os.path.join(tempfile.gettempdir(), "LumveilUpdate")
+            os.makedirs(target_dir, exist_ok=True)
+            filename = os.path.basename(info["asset_name"])
+            path = os.path.join(target_dir, filename)
+            request = urllib.request.Request(
+                info["asset_url"], headers={"User-Agent": f"Lumveil/{APP_VERSION}"})
+            digest = hashlib.sha256()
+            with urllib.request.urlopen(request, timeout=30) as response, open(path, "wb") as output:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    digest.update(chunk)
+            expected = info.get("digest", "")
+            if not expected.startswith("sha256:"):
+                raise ValueError("Release asset has no SHA-256 digest")
+            if digest.hexdigest().lower() != expected[7:].lower():
+                raise ValueError("SHA-256 verification failed")
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError,
+                OSError, ValueError) as exc:
+            error = str(exc)
+        try:
+            self.root.after(0, lambda: self._finish_update_download(path, error))
+        except tk.TclError:
+            pass
+
+    def _finish_update_download(self, path, error):
+        if error:
+            self._update_status_var.set(f"Download failed: {error}")
+            self._update_download_button.config(state=tk.NORMAL)
+            return
+        self._update_status_var.set("Download complete. Ready to install.")
+        if not messagebox.askyesno(
+                "Lumveil Update",
+                "Close Lumveil and start the installer now?",
+                parent=self._settings_win):
+            self._update_download_button.config(state=tk.NORMAL)
+            return
+        try:
+            subprocess.Popen([path], cwd=os.path.dirname(path))
+        except OSError as exc:
+            self._update_status_var.set(f"Could not start installer: {exc}")
+            self._update_download_button.config(state=tk.NORMAL)
+            return
+        self._on_close()
 
     # ── 画像調整ウィンドウ ─────────────────────────────────────────────────
 
+    def _settings_card(self, parent, *, padx=12, pady=(4, 8)):
+        """設定項目を載せる共通カード面。既存レイアウトを包むだけに留める。"""
+        card = tk.Frame(parent, bg=BG_CTRL, highlightbackground=BG_BORDER,
+                        highlightthickness=1)
+        card.pack(fill=tk.X, padx=padx, pady=pady)
+        return card
+
+    @staticmethod
+    def _settings_surface(widget):
+        try:
+            return widget.cget("bg")
+        except tk.TclError:
+            return BG_CTRL
+
+    def _settings_section_heading(self, parent, title, description=None):
+        """カード内の小見出しと任意の補足説明を同じ階層で表示する。"""
+        bg = self._settings_surface(parent)
+        box = tk.Frame(parent, bg=bg)
+        box.pack(fill=tk.X, padx=12, pady=(10, 5))
+        tk.Label(box, text=title, bg=bg, fg=COL_TXT,
+                 font=("Segoe UI", 10, "bold"), anchor="w").pack(fill=tk.X)
+        if description:
+            tk.Label(box, text=description, bg=bg, fg=COL_DIM,
+                     font=("Segoe UI", 8), anchor="w").pack(fill=tk.X, pady=(2, 0))
+        return box
+
+    def _style_toggle_button(self, button, enabled, tone="success"):
+        """既存のON/OFFボタンを共通の背景付き選択状態へ接続する。"""
+        if not hasattr(button, "_lumveil_neutral_bg"):
+            bg = self._settings_surface(button.master)
+            button._lumveil_neutral_bg = bg
+            button._lumveil_neutral_fg = COL_TXT
+            self._set_button_visual(button, bg, COL_TXT)
+            self._bind_button_states(button)
+        self._set_button_selected(button, enabled, tone)
+
+    def _recolor_settings_tree(self, widget, surface=BG_CTRL):
+        """既存詳細設定のBG_ADJだけをカード面へ寄せる低コスト移行用。"""
+        for child in widget.winfo_children():
+            try:
+                if child.cget("bg") == BG_ADJ:
+                    child.config(bg=surface)
+            except (tk.TclError, TypeError):
+                pass
+            if hasattr(child, "_lumveil_neutral_bg") and child._lumveil_neutral_bg == BG_ADJ:
+                child._lumveil_neutral_bg = surface
+            if hasattr(child, "_lumveil_bg") and child._lumveil_bg == BG_ADJ:
+                child._lumveil_bg = surface
+                child.config(bg=surface)
+            self._recolor_settings_tree(child, surface)
+
     def _add_settings_tab_intro(self, parent, title, description):
         """全設定タブで共通の見出しと短い説明を表示する。"""
-        head = tk.Frame(parent, bg=BG_ADJ)
-        head.pack(fill=tk.X, padx=16, pady=(12, 6))
-        tk.Label(head, text=title, bg=BG_ADJ, fg=COL_TXT,
-                 font=("Segoe UI", 12, "bold")).pack(anchor="w")
-        tk.Label(head, text=description, bg=BG_ADJ, fg=COL_DIM,
-                 font=("Segoe UI", 9)).pack(anchor="w", pady=(2, 0))
-        tk.Frame(parent, bg="#333333", height=1).pack(fill=tk.X, padx=12, pady=(0, 4))
+        head = tk.Frame(parent, bg=BG_APP)
+        head.pack(fill=tk.X, padx=16, pady=(12, 7))
+        tk.Label(head, text=title, bg=BG_APP, fg=COL_TXT,
+                 font=("Segoe UI", 13, "bold")).pack(anchor="w")
+        tk.Label(head, text=description, bg=BG_APP, fg=COL_DIM,
+                 font=("Segoe UI", 9)).pack(anchor="w", pady=(3, 0))
+
+    def _build_settings_tab_bar(self):
+        """Replace ttk's platform-dependent tab chrome with a flat tab strip."""
+        labels = [
+            (self._quick_tab, "QUICK"),
+            (self._picture_tab, "PICTURE"),
+            (self._playback_tab, "PLAYBACK"),
+            (self._advanced_tab, "ADVANCED"),
+            (self._about_tab, "ABOUT"),
+        ]
+        self._settings_tab_buttons = {}
+        self._settings_tab_lines = {}
+        for tab, label in labels:
+            cell = tk.Frame(self._settings_tab_bar, bg=BG_ADJ)
+            cell.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            button = tk.Button(
+                cell, text=label,
+                command=lambda target=tab: self._settings_tabs.select(target),
+                bg=BG_ADJ, fg=COL_DIM, activebackground=BG_BTN_H,
+                activeforeground=COL_TXT, relief=tk.FLAT, bd=0,
+                highlightthickness=0, font=("Segoe UI", 8), cursor="hand2",
+                padx=6, pady=7)
+            button.pack(fill=tk.X)
+            line = tk.Frame(cell, bg=BG_ADJ, height=2)
+            line.pack(fill=tk.X)
+            self._settings_tab_buttons[tab] = button
+            self._settings_tab_lines[tab] = line
+        self._settings_tabs.bind(
+            "<<NotebookTabChanged>>", self._sync_settings_tab_buttons, add="+")
+        self._sync_settings_tab_buttons()
+
+    def _sync_settings_tab_buttons(self, _event=None):
+        selected = str(self._settings_tabs.select())
+        for tab, button in getattr(self, "_settings_tab_buttons", {}).items():
+            active = str(tab) == selected
+            button.config(bg=BG_CTRL if active else BG_ADJ,
+                          fg=COL_BLU if active else COL_DIM)
+            self._settings_tab_lines[tab].config(bg=COL_BLU if active else BG_ADJ)
 
     def _build_adj_win(self):
         self._settings_win = tk.Toplevel(self.root)
         self._settings_win.title("設定")
         self._settings_win.configure(bg=BG_ADJ)
         self._settings_win.resizable(True, True)
-        self._settings_win.minsize(680, 480)
+        self._settings_win.minsize(760, 520)
+        self._settings_win.geometry("780x560")
+        _apply_dark_titlebar(self._settings_win)
         self._settings_win.withdraw()
         self._settings_win.protocol("WM_DELETE_WINDOW", self._settings_win.withdraw)
         self._adj_win = self._settings_win
+
+        settings_head = tk.Frame(self._settings_win, bg=BG_ADJ)
+        settings_head.pack(fill=tk.X, padx=22, pady=(16, 8))
+        tk.Label(settings_head, text="SETTINGS", bg=BG_ADJ, fg=COL_TXT,
+                 font=("Segoe UI", 12, "bold")).pack(side=tk.LEFT)
+        tk.Frame(self._settings_win, bg=BG_BORDER, height=1).pack(fill=tk.X, padx=22)
+        self._settings_tab_bar = tk.Frame(self._settings_win, bg=BG_ADJ)
+        self._settings_tab_bar.pack(fill=tk.X, padx=16, pady=(4, 0))
         self._settings_tabs = ttk.Notebook(self._settings_win, style="Lumveil.TNotebook")
-        self._settings_tabs.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self._settings_tabs.pack(fill=tk.BOTH, expand=True, padx=16, pady=(8, 8))
         self._settings_status = tk.StringVar(value="")
         tk.Label(self._settings_win, textvariable=self._settings_status,
                  bg=BG_ADJ, fg=COL_YEL, anchor="w",
@@ -1450,24 +2138,27 @@ class VideoPlayer:
         self._settings_tabs.add(win, text="画質を調整")
         self._add_settings_tab_intro(win, "画質を調整", "映像の見た目を細かく調整したいときに使います。")
 
-        mode_row = tk.Frame(win, bg=BG_ADJ)
-        mode_row.pack(fill=tk.X, padx=16, pady=(8, 4))
-        tk.Label(mode_row, text="映像モード:", bg=BG_ADJ, fg=COL_TXT,
+        win = self._settings_card(win, pady=(4, 10))
+        surface = self._settings_surface(win)
+
+        mode_row = tk.Frame(win, bg=surface)
+        mode_row.pack(fill=tk.X, padx=12, pady=(10, 4))
+        tk.Label(mode_row, text="映像モード:", bg=surface, fg=COL_TXT,
                  font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(0, 6))
         for mname in PICTURE_MODES:
             b = self._btn(mode_row, mname, lambda m=mname: self._apply_picture_mode(m),
-                         bg=BG_ADJ, pad=(8, 3))
+                         bg=surface, pad=(8, 3))
             b.pack(side=tk.LEFT, padx=2)
             self._mode_btns[mname] = b
-        self._mode_btns[self._picture_mode].config(fg=COL_GRN)
+        self._set_button_selected(self._mode_btns[self._picture_mode], True, "accent")
 
-        tk.Frame(win, bg="#333333", height=1).pack(fill=tk.X, padx=12, pady=(4, 2))
+        tk.Frame(win, bg=BG_BORDER, height=1).pack(fill=tk.X, padx=12, pady=(4, 2))
 
         for key, label, lo, hi, default in ADJ_PARAMS:
-            row = tk.Frame(win, bg=BG_ADJ)
-            row.pack(fill=tk.X, padx=16, pady=4)
+            row = tk.Frame(win, bg=surface)
+            row.pack(fill=tk.X, padx=12, pady=3)
             tk.Label(row, text=f"{label}:", width=SETTING_LABEL_W, anchor="w",
-                     bg=BG_ADJ, fg=COL_TXT, font=("Segoe UI", 10)).pack(side=tk.LEFT)
+                     bg=surface, fg=COL_TXT, font=("Segoe UI", 10)).pack(side=tk.LEFT)
             var = tk.DoubleVar(value=default)
             self._adj_vars[key] = (var, default)
             sc = ttk.Scale(row, from_=lo, to=hi, orient=tk.HORIZONTAL, variable=var,
@@ -1477,18 +2168,18 @@ class VideoPlayer:
             self._fix_scale_click(sc, var, lo, hi)
             disp = tk.StringVar(value=f"{default:+d}")
             tk.Label(row, textvariable=disp, width=5,
-                     bg=BG_ADJ, fg=COL_BLU, font=("Consolas", 9)).pack(side=tk.LEFT)
+                     bg=surface, fg=COL_BLU, font=("Consolas", 9)).pack(side=tk.LEFT)
             var.trace_add("write",
                 lambda *_, v=var, d=disp: d.set(f"{int(round(v.get())):+d}"))
             self._btn(row, "↺", lambda k=key: self._reset_adj(k),
-                      bg=BG_ADJ, pad=(5, 3)).pack(side=tk.LEFT, padx=4)
+                      bg=surface, pad=(5, 3)).pack(side=tk.LEFT, padx=4)
 
-        tk.Frame(win, bg="#333333", height=1).pack(fill=tk.X, padx=12, pady=(6, 2))
+        tk.Frame(win, bg=BG_BORDER, height=1).pack(fill=tk.X, padx=12, pady=(6, 2))
 
-        tr = tk.Frame(win, bg=BG_ADJ)
-        tr.pack(fill=tk.X, padx=16, pady=4)
+        tr = tk.Frame(win, bg=surface)
+        tr.pack(fill=tk.X, padx=12, pady=3)
         tk.Label(tr, text="暗闇補正の閾値:", width=SETTING_LABEL_W, anchor="w",
-                 bg=BG_ADJ, fg=COL_YEL, font=("Segoe UI", 10)).pack(side=tk.LEFT)
+                 bg=surface, fg=COL_TXT, font=("Segoe UI", 10)).pack(side=tk.LEFT)
         self._thresh_var = tk.DoubleVar(value=self._dark_thresh)
         ts = ttk.Scale(tr, from_=0.0, to=1.0, orient=tk.HORIZONTAL,
                        variable=self._thresh_var, length=200,
@@ -1499,24 +2190,26 @@ class VideoPlayer:
         self._fix_scale_click(ts, self._thresh_var, 0.0, 0.9)
         td = tk.StringVar(value=f"{self._dark_thresh:.2f}")
         tk.Label(tr, textvariable=td, width=5,
-                 bg=BG_ADJ, fg=COL_YEL, font=("Consolas", 9)).pack(side=tk.LEFT)
+                 bg=surface, fg=COL_YEL, font=("Consolas", 9)).pack(side=tk.LEFT)
         self._thresh_var.trace_add("write",
             lambda *_: td.set(f"{self._thresh_var.get():.2f}"))
         tk.Label(tr, text="← 鈍感   敏感 →",
-                 bg=BG_ADJ, fg=COL_DIM, font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=6)
+                 bg=surface, fg=COL_DIM, font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=6)
 
-        tk.Frame(win, bg="#333333", height=1).pack(fill=tk.X, padx=12, pady=(4, 2))
+        tk.Frame(win, bg=BG_BORDER, height=1).pack(fill=tk.X, padx=12, pady=(4, 2))
 
-        br = tk.Frame(win, bg=BG_ADJ, pady=8)
+        br = tk.Frame(win, bg=surface, pady=5)
         br.pack()
-        self._btn(br, "↺ すべてリセット", self._reset_all_adj,
-                  bg=BG_RED, pad=(10, 5)).pack(side=tk.LEFT, padx=5)
+        reset_all_btn = self._btn(br, "↺ すべてリセット", self._reset_all_adj,
+                                  fg=COL_RED, bg=BG_DANGER, pad=(10, 5))
+        self._set_button_visual(reset_all_btn, BG_DANGER, COL_RED, BG_PRESSED)
+        reset_all_btn.pack(side=tk.LEFT, padx=5)
 
         # シャドウリフト手動スライダー（AUTO停止中のみ操作可、AUTO稼働中はAUTOが制御）
-        sl_row = tk.Frame(win, bg=BG_ADJ)
-        sl_row.pack(fill=tk.X, padx=16, pady=(0, 8))
+        sl_row = tk.Frame(win, bg=surface)
+        sl_row.pack(fill=tk.X, padx=12, pady=(0, 5))
         tk.Label(sl_row, text="シャドウリフト:", width=SETTING_LABEL_W, anchor="w",
-                 bg=BG_ADJ, fg=COL_TXT, font=("Segoe UI", 10)).pack(side=tk.LEFT)
+                 bg=surface, fg=COL_TXT, font=("Segoe UI", 10)).pack(side=tk.LEFT)
         self._shadow_lift_scale = ttk.Scale(
             sl_row, from_=0, to=100, orient=tk.HORIZONTAL,
             variable=self._manual_shadow_lift, length=200,
@@ -1526,66 +2219,73 @@ class VideoPlayer:
         self._fix_scale_click(self._shadow_lift_scale, self._manual_shadow_lift, 0, 100)
         sl_disp = tk.StringVar(value=f"{int(round(self._manual_shadow_lift.get()))}%")
         tk.Label(sl_row, textvariable=sl_disp, width=5,
-                 bg=BG_ADJ, fg=COL_BLU, font=("Consolas", 9)).pack(side=tk.LEFT)
+                 bg=surface, fg=COL_BLU, font=("Consolas", 9)).pack(side=tk.LEFT)
         self._manual_shadow_lift.trace_add("write",
             lambda *_, v=self._manual_shadow_lift, d=sl_disp: d.set(f"{int(round(v.get()))}%"))
         if self._rt_enabled:
             self._shadow_lift_scale.config(state=tk.DISABLED)
 
-        br2 = tk.Frame(win, bg=BG_ADJ, pady=4)
+        br2 = tk.Frame(win, bg=surface, pady=4)
         br2.pack()
-        self._btn(br2, "💾 設定を保存", self._save_adj,
-                  bg=BG_ADJ, pad=(10, 5)).pack(side=tk.LEFT, padx=5)
-        self._btn(br2, "📂 設定を読み込む", self._load_adj,
-                  bg=BG_ADJ, pad=(10, 5)).pack(side=tk.LEFT, padx=5)
+        self._btn(br2, "設定を保存", self._save_adj,
+                  bg=surface, pad=(10, 5)).pack(side=tk.LEFT, padx=5)
+        self._btn(br2, "設定を読み込む", self._load_adj,
+                  bg=surface, pad=(10, 5)).pack(side=tk.LEFT, padx=5)
 
     def _build_quick_settings(self, win):
         """初見の利用者が迷わず使える、日常的な設定だけを集約する。"""
         self._add_settings_tab_intro(win, "かんたん設定", "用途に合わせて選ぶだけで、よく使う設定をまとめて切り替えられます。")
-        quality_row = tk.Frame(win, bg=BG_ADJ)
-        quality_row.pack(fill=tk.X, padx=16, pady=(8, 4))
-        tk.Label(quality_row, text="用途別プリセット:", bg=BG_ADJ, fg=COL_TXT,
+        win = self._settings_card(win)
+        surface = self._settings_surface(win)
+        self._settings_section_heading(
+            win, "用途別プリセット", "画質と負荷の組み合わせをまとめて切り替えます。")
+        quality_row = tk.Frame(win, bg=surface)
+        quality_row.pack(fill=tk.X, padx=12, pady=(0, 4))
+        tk.Label(quality_row, text="プリセット:", bg=surface, fg=COL_TXT,
                  font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(0, 6))
         self._quality_preset_btns = {}
         quality_tips = {
             "軽快": "負荷を抑えたいとき。Anime4Kと通常フレーム補間を停止します。",
             "標準": "普段使い向け。画質と軽快さのバランスを取ります。",
             "アニメ高画質": "Anime4Kとデバンディングでアニメをきれいに表示します。",
-            "暗所優先": "⚡AUTOを使う準備を整えます。動画を開くまでAUTOは開始しません。",
+            "暗所優先": "AUTOを使う準備を整えます。動画を開くまでAUTOは開始しません。",
         }
         for pname in QUALITY_PRESETS:
             b = self._btn(quality_row, pname, lambda p=pname: self._apply_quality_preset(p),
-                          bg=BG_ADJ, pad=(7, 3), tooltip=quality_tips[pname])
+                          bg=surface, pad=(7, 3), tooltip=quality_tips[pname])
             b.pack(side=tk.LEFT, padx=2)
             self._quality_preset_btns[pname] = b
         self._quality_preset_status = tk.StringVar()
-        tk.Label(win, textvariable=self._quality_preset_status, bg=BG_ADJ, fg=COL_DIM,
-                 font=("Segoe UI", 8)).pack(anchor="w", padx=16, pady=(0, 8))
+        tk.Label(win, textvariable=self._quality_preset_status, bg=surface, fg=COL_DIM,
+                 font=("Segoe UI", 8)).pack(anchor="w", padx=12, pady=(0, 8))
         self._sync_quality_preset_buttons()
 
-        tk.Frame(win, bg="#333333", height=1).pack(fill=tk.X, padx=12, pady=(2, 6))
-        row = tk.Frame(win, bg=BG_ADJ)
-        row.pack(fill=tk.X, padx=16, pady=4)
-        tk.Label(row, text="暗闇補正:", bg=BG_ADJ, fg=COL_TXT,
+        tk.Frame(win, bg=BG_BORDER, height=1).pack(fill=tk.X, padx=12, pady=(2, 0))
+        self._settings_section_heading(
+            win, "暗闇補正（AUTO）", "映像を解析して暗い場面の見やすさを自動調整します。")
+        row = tk.Frame(win, bg=surface)
+        row.pack(fill=tk.X, padx=12, pady=(0, 4))
+        tk.Label(row, text="暗闇補正:", bg=surface, fg=COL_TXT,
                  font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(0, 6))
-        self._rt_btn = self._btn(row, "⚡ AUTO: OFF", self._toggle_rt_adj,
-                                 bg=BG_ADJ, pad=(10, 5))
+        self._rt_btn = self._btn(row, "リアルタイム自動調整: OFF", self._toggle_rt_adj,
+                                 bg=surface, pad=(10, 5))
         self._rt_btn.pack(side=tk.LEFT)
-        modes = tk.Frame(win, bg=BG_ADJ)
-        modes.pack(fill=tk.X, padx=16, pady=(2, 8))
-        tk.Label(modes, text="強さ:", bg=BG_ADJ, fg=COL_DIM,
+        modes = tk.Frame(win, bg=surface)
+        modes.pack(fill=tk.X, padx=12, pady=(2, 6))
+        tk.Label(modes, text="強さ:", bg=surface, fg=COL_DIM,
                  font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(0, 6))
         for mname in ["OFF"] + list(RT_MODES.keys()):
             b = self._btn(modes, mname, lambda m=mname: self._select_rt_mode(m),
-                          bg=BG_ADJ, pad=(8, 3))
+                          bg=surface, pad=(8, 3))
             b.pack(side=tk.LEFT, padx=2)
             self._rt_mode_btns[mname] = b
         self._sync_rt_mode_buttons()
         self._auto_adj_status = tk.StringVar(value="")
-        tk.Label(win, textvariable=self._auto_adj_status, bg=BG_ADJ, fg=COL_GRN,
-                 font=("Segoe UI", 8), pady=6).pack(anchor="w", padx=16)
+        tk.Label(win, textvariable=self._auto_adj_status, bg=surface, fg=COL_GRN,
+                 font=("Segoe UI", 8), pady=5).pack(anchor="w", padx=12)
 
     def _toggle_adj_win(self):
+        self._close_quality_quick_panel()
         self._settings_tabs.select(self._quick_tab)
         if self._settings_win.winfo_viewable():
             self._settings_win.withdraw()
@@ -1599,11 +2299,13 @@ class VideoPlayer:
     # ── 字幕/音声の同期・見た目調整 ────────────────────────────────────────
 
     def _build_sync_controls(self, win):
+        surface = self._settings_surface(win)
+
         def _sync_row(label, lo, hi, default, unit, mpv_prop, fmt="{:+.1f}"):
-            row = tk.Frame(win, bg=BG_ADJ)
-            row.pack(fill=tk.X, padx=16, pady=4)
+            row = tk.Frame(win, bg=surface)
+            row.pack(fill=tk.X, padx=12, pady=4)
             tk.Label(row, text=f"{label}:", width=SETTING_LABEL_W, anchor="w",
-                     bg=BG_ADJ, fg=COL_TXT, font=("Segoe UI", 10)).pack(side=tk.LEFT)
+                     bg=surface, fg=COL_TXT, font=("Segoe UI", 10)).pack(side=tk.LEFT)
             var = tk.DoubleVar(value=default)
 
             def _apply(_=None, var=var, prop=mpv_prop):
@@ -1618,15 +2320,15 @@ class VideoPlayer:
             self._fix_scale_click(sc, var, lo, hi)
             disp = tk.StringVar(value=fmt.format(default))
             tk.Label(row, textvariable=disp, width=6,
-                     bg=BG_ADJ, fg=COL_BLU, font=("Consolas", 9)).pack(side=tk.LEFT)
+                     bg=surface, fg=COL_BLU, font=("Consolas", 9)).pack(side=tk.LEFT)
             var.trace_add("write", lambda *_, v=var, d=disp: d.set(fmt.format(v.get())))
-            tk.Label(row, text=unit, bg=BG_ADJ, fg=COL_DIM,
+            tk.Label(row, text=unit, bg=surface, fg=COL_DIM,
                      font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=4)
 
             def _reset(var=var, default=default):
                 var.set(default)
                 _apply()
-            self._btn(row, "↺", _reset, bg=BG_ADJ, pad=(5, 3)).pack(side=tk.LEFT, padx=4)
+            self._btn(row, "↺", _reset, bg=surface, pad=(5, 3)).pack(side=tk.LEFT, padx=4)
             return var
 
         self._sub_delay_var = _sync_row("字幕遅延", -5.0, 5.0, 0.0, "秒", "sub-delay")
@@ -1668,9 +2370,10 @@ class VideoPlayer:
 
     def _add_advanced_section(self, parent, title, description):
         """詳細設定の項目を必要な時だけ開く折りたたみセクションとして作る。"""
-        outer = tk.Frame(parent, bg=BG_ADJ)
-        outer.pack(fill=tk.X, padx=12, pady=(3, 0))
-        body = tk.Frame(outer, bg=BG_ADJ)
+        outer = tk.Frame(parent, bg=BG_CTRL, highlightbackground=BG_BORDER,
+                         highlightthickness=1)
+        outer.pack(fill=tk.X, padx=12, pady=(4, 2))
+        body = tk.Frame(outer, bg=BG_CTRL)
         visible = tk.BooleanVar(value=False)
 
         def toggle():
@@ -1683,13 +2386,12 @@ class VideoPlayer:
                 visible.set(True)
                 button.config(text=f"▼ {title}")
 
-        button = tk.Button(outer, text=f"▶ {title}", command=toggle,
-                           anchor="w", bg=BG_BTN, fg=COL_TXT, relief=tk.FLAT, bd=0,
-                           activebackground=BG_BTN_H, activeforeground=COL_TXT,
-                           font=("Segoe UI", 10, "bold"), padx=10, pady=6, cursor="hand2")
+        button = self._btn(outer, f"▶ {title}", toggle, bg=BG_CTRL,
+                           font=("Segoe UI", 10, "bold"), pad=(10, 6))
+        button.config(anchor="w")
         button.pack(fill=tk.X)
-        tk.Label(outer, text=description, bg=BG_ADJ, fg=COL_DIM,
-                 font=("Segoe UI", 8), anchor="w").pack(fill=tk.X, padx=10, pady=(2, 0))
+        tk.Label(outer, text=description, bg=BG_CTRL, fg=COL_DIM,
+                 font=("Segoe UI", 8), anchor="w").pack(fill=tk.X, padx=10, pady=(0, 5))
         return body
 
     def _make_vertical_scroll_area(self, parent):
@@ -1817,10 +2519,11 @@ class VideoPlayer:
         }
 
         def _row(label):
-            r = tk.Frame(win, bg=BG_ADJ)
+            surface = self._settings_surface(win)
+            r = tk.Frame(win, bg=surface)
             r.pack(fill=tk.X, padx=16, pady=5)
             lbl = tk.Label(r, text=f"{label}:", width=SETTING_LABEL_W, anchor="w",
-                           bg=BG_ADJ, fg=COL_TXT, font=("Segoe UI", 10))
+                           bg=surface, fg=COL_TXT, font=("Segoe UI", 10))
             lbl.pack(side=tk.LEFT)
             if label in _TIPS:
                 _ToolTip(lbl, _TIPS[label])
@@ -1869,6 +2572,7 @@ class VideoPlayer:
             font=("Segoe UI", 10), width=8, padx=6, pady=3, cursor="hand2",
             activebackground=BG_BTN_H, activeforeground=COL_TXT)
         self._deband_btn.pack(side=tk.LEFT)
+        self._style_toggle_button(self._deband_btn, self._gpu_deband)
 
         # アンチリンギング
         r = _row("アンチリンギング")
@@ -1895,6 +2599,7 @@ class VideoPlayer:
             font=("Segoe UI", 10), width=8, padx=6, pady=3, cursor="hand2",
             activebackground=BG_BTN_H, activeforeground=COL_TXT)
         self._sigmoid_btn.pack(side=tk.LEFT)
+        self._style_toggle_button(self._sigmoid_btn, self._gpu_sigmoid)
 
         # 縮小補正
         r = _row("縮小補正")
@@ -1906,6 +2611,7 @@ class VideoPlayer:
             font=("Segoe UI", 10), width=8, padx=6, pady=3, cursor="hand2",
             activebackground=BG_BTN_H, activeforeground=COL_TXT)
         self._correct_ds_btn.pack(side=tk.LEFT)
+        self._style_toggle_button(self._correct_ds_btn, self._gpu_correct_ds)
 
         # なめらかさ
         win = self._smooth_tab
@@ -1920,6 +2626,7 @@ class VideoPlayer:
             font=("Segoe UI", 10), width=8, padx=6, pady=3, cursor="hand2",
             activebackground=BG_BTN_H, activeforeground=COL_TXT)
         self._interpolate_btn.pack(side=tk.LEFT)
+        self._style_toggle_button(self._interpolate_btn, self._gpu_interpolate)
 
         # AMD AMFフレーム補間（GPUハードウェアによる動き補償型の実補間）
         r = _row("AMD AMF補間")
@@ -1931,17 +2638,19 @@ class VideoPlayer:
             font=("Segoe UI", 10), width=8, padx=6, pady=3, cursor="hand2",
             activebackground=BG_BTN_H, activeforeground=COL_TXT)
         self._amf_frc_btn.pack(side=tk.LEFT)
+        self._style_toggle_button(self._amf_frc_btn, self._gpu_amf_frc)
         r = _row("ノイズ軽減")
         self._denoise_btn = tk.Button(
-            r, text="🔇 ノイズ軽減: OFF", command=self._toggle_denoise,
+            r, text="ノイズ軽減: OFF", command=self._toggle_denoise,
             bg=BG_ADJ, fg=COL_TXT, relief=tk.FLAT, bd=0,
             font=("Segoe UI", 10), width=16, padx=6, pady=3, cursor="hand2",
             activebackground=BG_BTN_H, activeforeground=COL_TXT)
         self._denoise_btn.pack(side=tk.LEFT)
+        self._style_toggle_button(self._denoise_btn, self._denoise)
 
         # シェーダー
         win = self._shader_tab
-        tk.Frame(win, bg="#333333", height=1).pack(fill=tk.X, padx=12, pady=(6, 2))
+        tk.Frame(win, bg=BG_BORDER, height=1).pack(fill=tk.X, padx=12, pady=(6, 2))
 
         # Anime4Kプリセット
         ar = _row("Anime4Kプリセット")
@@ -1951,9 +2660,9 @@ class VideoPlayer:
                          tooltip=ANIME4K_DESCRIPTIONS[pname])
             b.pack(side=tk.LEFT, padx=2)
             self._a4k_btns[pname] = b
-        self._a4k_btns["なし"].config(fg=COL_GRN)
+        self._set_button_selected(self._a4k_btns["なし"], True, "accent")
 
-        tk.Frame(win, bg="#333333", height=1).pack(fill=tk.X, padx=12, pady=(4, 2))
+        tk.Frame(win, bg=BG_BORDER, height=1).pack(fill=tk.X, padx=12, pady=(4, 2))
 
         # GLSLシェーダー
         r = _row("GLSLシェーダー")
@@ -1969,7 +2678,7 @@ class VideoPlayer:
         sb = tk.Scrollbar(glsl_frame, orient=tk.VERTICAL)
         self._glsl_listbox = tk.Listbox(
             glsl_frame, height=4, yscrollcommand=sb.set,
-            bg="#1a1a1a", fg=COL_BLU, selectbackground="#2a4a6a",
+            bg=BG_CTRL, fg=COL_BLU, selectbackground=BG_SELECTED,
             font=("Consolas", 8), relief=tk.FLAT, bd=0,
             activestyle="none")
         sb.config(command=self._glsl_listbox.yview)
@@ -1978,7 +2687,7 @@ class VideoPlayer:
         for p in self._gpu_glsl:
             self._glsl_listbox.insert(tk.END, os.path.basename(p))
 
-        tk.Frame(win, bg="#333333", height=1).pack(fill=tk.X, padx=12, pady=(2, 2))
+        tk.Frame(win, bg=BG_BORDER, height=1).pack(fill=tk.X, padx=12, pady=(2, 2))
 
         # GPU再生支援（従来のハードウェアデコード）
         win = self._decode_tab
@@ -1997,7 +2706,7 @@ class VideoPlayer:
                            activebackground=BG_BTN_H, activeforeground=COL_TXT)
         hom.pack(side=tk.LEFT)
 
-        tk.Frame(win, bg="#333333", height=1).pack(fill=tk.X, padx=12, pady=(4, 2))
+        tk.Frame(win, bg=BG_BORDER, height=1).pack(fill=tk.X, padx=12, pady=(4, 2))
 
         # 映像出力
         win = self._output_tab
@@ -2044,13 +2753,16 @@ class VideoPlayer:
             font=("Segoe UI", 10), width=8, padx=6, pady=3, cursor="hand2",
             activebackground=BG_BTN_H, activeforeground=COL_TXT)
         self._deinterlace_btn.pack(side=tk.LEFT)
+        self._style_toggle_button(self._deinterlace_btn, self._gpu_deinterlace)
 
-        tk.Frame(win, bg="#333333", height=1).pack(fill=tk.X, padx=12, pady=(4, 2))
+        tk.Frame(win, bg=BG_BORDER, height=1).pack(fill=tk.X, padx=12, pady=(4, 2))
 
         br = tk.Frame(win, bg=BG_ADJ, pady=8)
         br.pack()
-        self._btn(br, "↺ リセット", self._reset_gpu,
-                  bg=BG_RED, pad=(10, 5)).pack(side=tk.LEFT, padx=5)
+        reset_gpu_btn = self._btn(br, "↺ リセット", self._reset_gpu,
+                                  fg=COL_RED, bg=BG_DANGER, pad=(10, 5))
+        self._set_button_visual(reset_gpu_btn, BG_DANGER, COL_RED, BG_PRESSED)
+        reset_gpu_btn.pack(side=tk.LEFT, padx=5)
 
         self._gpu_status = tk.StringVar(value="")
         tk.Label(win, textvariable=self._gpu_status,
@@ -2058,6 +2770,11 @@ class VideoPlayer:
                  font=("Segoe UI", 8), pady=6).pack()
         self._build_playback_settings_tab()
         self._build_toolbar_settings_tab()
+        self._build_about_settings_tab()
+        for section in (self._smooth_tab, self._decode_tab,
+                        self._shader_tab, self._output_tab):
+            self._recolor_settings_tree(section, BG_CTRL)
+        self._build_settings_tab_bar()
 
     def _build_playback_settings_tab(self):
         tab = tk.Frame(self._settings_tabs, bg=BG_ADJ)
@@ -2065,13 +2782,17 @@ class VideoPlayer:
         self._settings_tabs.add(tab, text="再生と字幕")
         self._add_settings_tab_intro(tab, "再生と字幕", "連続再生・再開位置・字幕と音声の同期を設定します。")
 
+        tab = self._settings_card(tab)
+        surface = self._settings_surface(tab)
+        self._settings_section_heading(tab, "再生動作")
+
         def option_row(label, variable, options, command):
-            row = tk.Frame(tab, bg=BG_ADJ)
-            row.pack(fill=tk.X, padx=16, pady=6)
+            row = tk.Frame(tab, bg=surface)
+            row.pack(fill=tk.X, padx=12, pady=5)
             tk.Label(row, text=f"{label}:", width=SETTING_LABEL_W, anchor="w",
-                     bg=BG_ADJ, fg=COL_TXT, font=("Segoe UI", 10)).pack(side=tk.LEFT)
+                     bg=surface, fg=COL_TXT, font=("Segoe UI", 10)).pack(side=tk.LEFT)
             menu = tk.OptionMenu(row, variable, *options, command=command)
-            menu.config(bg=BG_ADJ, fg=COL_TXT, activebackground=BG_BTN_H,
+            menu.config(bg=surface, fg=COL_TXT, activebackground=BG_BTN_H,
                         activeforeground=COL_TXT, highlightthickness=0,
                         relief=tk.FLAT, font=("Segoe UI", 10), width=22)
             menu["menu"].config(bg=BG_ADJ, fg=COL_TXT,
@@ -2081,10 +2802,10 @@ class VideoPlayer:
         self._eof_var = tk.StringVar(value="次の動画を再生" if self._playback_eof_action == "next" else "停止")
         option_row("再生終了時", self._eof_var, ("停止", "次の動画を再生"), self._on_eof_setting)
 
-        row = tk.Frame(tab, bg=BG_ADJ)
-        row.pack(fill=tk.X, padx=16, pady=6)
+        row = tk.Frame(tab, bg=surface)
+        row.pack(fill=tk.X, padx=12, pady=5)
         tk.Label(row, text="前回位置から再開:", width=SETTING_LABEL_W, anchor="w",
-                 bg=BG_ADJ, fg=COL_TXT, font=("Segoe UI", 10)).pack(side=tk.LEFT)
+                 bg=surface, fg=COL_TXT, font=("Segoe UI", 10)).pack(side=tk.LEFT)
         self._resume_btn = tk.Button(row, text="ON" if self._resume_enabled else "OFF",
                                      command=self._toggle_resume_enabled,
                                      bg=BG_ADJ, fg=COL_GRN if self._resume_enabled else COL_TXT,
@@ -2092,16 +2813,69 @@ class VideoPlayer:
                                      padx=6, pady=3, cursor="hand2",
                                      activebackground=BG_BTN_H, activeforeground=COL_TXT)
         self._resume_btn.pack(side=tk.LEFT)
+        self._style_toggle_button(self._resume_btn, self._resume_enabled)
 
         self._end_var = tk.StringVar(value="先頭へ戻る" if self._folder_end_action == "loop" else "停止")
         option_row("フォルダ末尾", self._end_var, ("停止", "先頭へ戻る"), self._on_folder_end_setting)
 
         self._sort_var = tk.StringVar(value="更新日時順" if self._playlist_sort == "modified" else "ファイル名順")
         option_row("次の動画の並び", self._sort_var, ("ファイル名順", "更新日時順"), self._on_playlist_sort_setting)
-        tk.Frame(tab, bg="#333333", height=1).pack(fill=tk.X, padx=12, pady=(8, 4))
-        tk.Label(tab, text="字幕と音声の同期", bg=BG_ADJ, fg=COL_BLU,
-                 font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=16, pady=(4, 0))
+        tk.Frame(tab, bg=BG_BORDER, height=1).pack(fill=tk.X, padx=12, pady=(8, 0))
+        self._settings_section_heading(
+            tab, "字幕と音声の同期", "映像に合わせて字幕・音声のタイミングと字幕サイズを調整します。")
         self._build_sync_controls(tab)
+
+    def _build_about_settings_tab(self):
+        tab = tk.Frame(self._settings_tabs, bg=BG_ADJ)
+        self._about_tab = tab
+        self._settings_tabs.add(tab, text="About")
+        self._add_settings_tab_intro(
+            tab, "About Lumveil", "Application information, updates, and licenses.")
+
+        card = self._settings_card(tab)
+        surface = self._settings_surface(card)
+        app_row = tk.Frame(card, bg=surface)
+        app_row.pack(fill=tk.X, padx=16, pady=(14, 10))
+        tk.Label(app_row, text="LUMVEIL", bg=surface, fg=COL_BLU,
+                 font=("Segoe UI", 20, "bold")).pack(anchor="w")
+        tk.Label(app_row, text=f"Version {APP_VERSION}", bg=surface, fg=COL_DIM,
+                 font=("Segoe UI", 10)).pack(anchor="w", pady=(2, 0))
+        tk.Label(app_row, text="Created by ふぁん", bg=surface, fg=COL_TXT,
+                 font=("Segoe UI", 10)).pack(anchor="w", pady=(8, 0))
+        links = tk.Frame(card, bg=surface)
+        links.pack(fill=tk.X, padx=16, pady=(0, 14))
+        self._btn(links, "Open GitHub", lambda: webbrowser.open(GITHUB_URL),
+                  bg=surface, pad=(12, 5)).pack(side=tk.LEFT)
+        self._btn(links, "Third-party licenses", self._open_license_notices,
+                  bg=surface, pad=(12, 5)).pack(side=tk.LEFT, padx=(8, 0))
+
+        update = self._settings_card(tab)
+        update_surface = self._settings_surface(update)
+        self._settings_section_heading(
+            update, "Updates", "Check GitHub Releases without interrupting playback.")
+        toggle_row = tk.Frame(update, bg=update_surface)
+        toggle_row.pack(fill=tk.X, padx=12, pady=(0, 8))
+        tk.Label(toggle_row, text="Automatic update checks:", bg=update_surface,
+                 fg=COL_TXT, font=("Segoe UI", 10)).pack(side=tk.LEFT)
+        self._auto_update_button = self._btn(
+            toggle_row, "ON" if self._auto_update_checks else "OFF",
+            self._toggle_auto_update_checks, bg=update_surface, pad=(12, 4))
+        self._auto_update_button.pack(side=tk.LEFT, padx=(10, 0))
+        self._style_toggle_button(self._auto_update_button, self._auto_update_checks)
+
+        actions = tk.Frame(update, bg=update_surface)
+        actions.pack(fill=tk.X, padx=12, pady=(0, 8))
+        self._btn(actions, "Check now", lambda: self._check_for_updates(manual=True),
+                  bg=update_surface, pad=(12, 5)).pack(side=tk.LEFT)
+        self._update_download_button = self._btn(
+            actions, "Download and install", self._download_update,
+            bg=BG_SELECTED, fg=COL_BLU, pad=(12, 5))
+        self._update_download_button.pack(side=tk.LEFT, padx=(8, 0))
+        self._update_download_button.config(state=tk.DISABLED)
+        self._update_status_var = tk.StringVar(value="Not checked yet.")
+        tk.Label(update, textvariable=self._update_status_var, bg=update_surface,
+                 fg=COL_DIM, justify=tk.LEFT, anchor="w", wraplength=590,
+                 font=("Segoe UI", 9)).pack(fill=tk.X, padx=12, pady=(0, 14))
 
     def _on_eof_setting(self, value):
         self._playback_eof_action = "next" if value == "次の動画を再生" else "stop"
@@ -2109,8 +2883,8 @@ class VideoPlayer:
 
     def _toggle_resume_enabled(self):
         self._resume_enabled = not self._resume_enabled
-        self._resume_btn.config(text="ON" if self._resume_enabled else "OFF",
-                                fg=COL_GRN if self._resume_enabled else COL_TXT)
+        self._resume_btn.config(text="ON" if self._resume_enabled else "OFF")
+        self._style_toggle_button(self._resume_btn, self._resume_enabled)
         if not self._resume_enabled:
             self._resume_positions.clear()
         self._save_player_settings()
@@ -2130,14 +2904,17 @@ class VideoPlayer:
         if hasattr(self, "_toolbar_section"):
             self._toolbar_section.destroy()
         self._toolbar_section = tk.Frame(self._advanced_content, bg=BG_ADJ)
-        self._toolbar_section.pack(fill=tk.X, padx=12, pady=(3, 0))
+        self._toolbar_section.pack(fill=tk.X, pady=(3, 0))
         tab = self._add_advanced_section(
             self._toolbar_section, "操作バー", "表示するボタンと並び順")
         self._toolbar_tab = tab
         self._toolbar_icons = {
-            "fullscreen": "⛶", "pin": "📌", "about": "ⓘ", "auto_adjust": "⚡",
-            "gpu": "⚙ GPU", "recent": "🕘", "playlist": "☷", "audio": "🎵", "subtitles": "💬",
-            "ab_repeat": "A-B", "screenshot": "📷", "bookmark": "🔖", "speed": "1.00×",
+            "fullscreen": self._icons["fullscreen"], "pin": self._icons["pin"],
+            "about": self._icons["info"], "auto_adjust": "AUTO", "quality": "画質", "gpu": "GPU",
+            "recent": self._icons["recent"], "playlist": self._icons["playlist"],
+            "audio": self._icons["audio"], "subtitles": self._icons["subtitles"],
+            "ab_repeat": "A-B", "screenshot": self._icons["screenshot"],
+            "bookmark": self._icons["bookmark"], "speed": "1.00×",
         }
         tk.Label(tab, text="操作バー", bg=BG_ADJ, fg=COL_TXT,
                  font=("Segoe UI", 12, "bold")).pack(anchor="w", padx=16, pady=(12, 2))
@@ -2145,7 +2922,7 @@ class VideoPlayer:
                  bg=BG_ADJ, fg=COL_DIM, font=("Segoe UI", 9)).pack(anchor="w", padx=16)
         tk.Label(tab, text="プレビュー", bg=BG_ADJ, fg=COL_BLU,
                  font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=16, pady=(12, 3))
-        self._toolbar_preview = tk.Frame(tab, bg="#080808", bd=1, relief=tk.SOLID)
+        self._toolbar_preview = tk.Frame(tab, bg=BG_APP, bd=1, relief=tk.SOLID)
         self._toolbar_preview.pack(fill=tk.X, padx=16)
 
         tk.Label(tab, text="常時表示する項目", bg=BG_ADJ, fg=COL_BLU,
@@ -2164,8 +2941,12 @@ class VideoPlayer:
             handle.bind("<ButtonPress-1>", lambda e, k=key: self._toolbar_drag_start(e, k))
             handle.bind("<B1-Motion>", self._toolbar_drag_motion)
             handle.bind("<ButtonRelease-1>", self._toolbar_drag_end)
+            icon_font = (self._icon_font if key in {
+                "fullscreen", "pin", "about", "recent", "playlist", "audio",
+                "subtitles", "screenshot", "bookmark"
+            } else ("Segoe UI", 10))
             tk.Label(row, text=self._toolbar_icons[key], width=7, anchor="w",
-                     bg=BG_ADJ, fg=COL_TXT, font=("Segoe UI", 10)).pack(side=tk.LEFT)
+                     bg=BG_ADJ, fg=COL_TXT, font=icon_font).pack(side=tk.LEFT)
             tk.Label(row, text=definitions[key][0], width=24, anchor="w",
                      bg=BG_ADJ, fg=COL_TXT, font=("Segoe UI", 10)).pack(side=tk.LEFT)
             var = tk.BooleanVar(value=key in self._toolbar_visible)
@@ -2175,7 +2956,7 @@ class VideoPlayer:
                            activebackground=BG_ADJ, activeforeground=COL_TXT,
                            font=("Segoe UI", 10), bd=0, highlightthickness=0).pack(side=tk.RIGHT)
 
-        tk.Frame(tab, bg="#333333", height=1).pack(fill=tk.X, padx=16, pady=(2, 8))
+        tk.Frame(tab, bg=BG_BORDER, height=1).pack(fill=tk.X, padx=16, pady=(2, 8))
         shot_box = tk.Frame(tab, bg=BG_ADJ)
         shot_box.pack(fill=tk.X, padx=16, pady=(0, 12))
         tk.Label(shot_box, text="スクリーンショットの保存先", anchor="w",
@@ -2188,8 +2969,10 @@ class VideoPlayer:
         self._btn(shot_row, "変更…", self._change_shot_folder,
                   bg=BG_ADJ, font=("Segoe UI", 10), pad=(10, 4)).pack(side=tk.RIGHT)
         self._refresh_toolbar_settings()
+        self._recolor_settings_tree(tab, BG_CTRL)
 
     def _toggle_gpu_win(self):
+        self._close_quality_quick_panel()
         self._settings_tabs.select(self._advanced_tab)
         if not self._settings_win.winfo_viewable():
             x = self.root.winfo_rootx() + 20
@@ -2203,7 +2986,7 @@ class VideoPlayer:
         if not hasattr(self, "_quality_preset_btns"):
             return
         for name, btn in self._quality_preset_btns.items():
-            btn.config(fg=COL_GRN if name == self._quality_preset else COL_TXT)
+            self._set_button_selected(btn, name == self._quality_preset, "accent")
         if hasattr(self, "_quality_preset_status"):
             text = (f"選択中: {self._quality_preset}"
                     if self._quality_preset in QUALITY_PRESETS
@@ -2246,6 +3029,9 @@ class VideoPlayer:
             self._interpolate_btn.config(text="ON" if self._gpu_interpolate else "OFF",
                                          fg=COL_GRN if self._gpu_interpolate else COL_TXT)
             self._amf_frc_btn.config(text="OFF", fg=COL_TXT)
+            self._style_toggle_button(self._deband_btn, self._gpu_deband)
+            self._style_toggle_button(self._interpolate_btn, self._gpu_interpolate)
+            self._style_toggle_button(self._amf_frc_btn, False)
             self._quality_preset = name
             self._sync_quality_preset_buttons()
             self._save_gpu_settings()
@@ -2282,6 +3068,7 @@ class VideoPlayer:
         self._deband_btn.config(
             text="ON" if self._gpu_deband else "OFF",
             fg=COL_GRN if self._gpu_deband else COL_TXT)
+        self._style_toggle_button(self._deband_btn, self._gpu_deband)
         try:
             self.player["deband"] = self._gpu_deband
             self._gpu_status.set(
@@ -2304,6 +3091,7 @@ class VideoPlayer:
         on = self._gpu_sigmoid
         self._sigmoid_btn.config(text="ON" if on else "OFF",
                                  fg=COL_GRN if on else COL_TXT)
+        self._style_toggle_button(self._sigmoid_btn, on)
         try:
             self.player["sigmoid-upscaling"] = on
             self._gpu_status.set(f"✓ シグモイド拡大: {'ON' if on else 'OFF'}")
@@ -2316,6 +3104,7 @@ class VideoPlayer:
         on = self._gpu_correct_ds
         self._correct_ds_btn.config(text="ON" if on else "OFF",
                                     fg=COL_GRN if on else COL_TXT)
+        self._style_toggle_button(self._correct_ds_btn, on)
         try:
             self.player["correct-downscaling"] = on
             self._gpu_status.set(f"✓ 縮小補正: {'ON' if on else 'OFF'}")
@@ -2345,9 +3134,11 @@ class VideoPlayer:
             # フレーム補間とAMD AMFフレーム補間は目的が重複し二重負荷になるため排他化
             self._gpu_amf_frc = False
             self._amf_frc_btn.config(text="OFF", fg=COL_TXT)
+            self._style_toggle_button(self._amf_frc_btn, False)
             self._apply_vf_chain()
         self._interpolate_btn.config(text="ON" if on else "OFF",
                                      fg=COL_GRN if on else COL_TXT)
+        self._style_toggle_button(self._interpolate_btn, on)
         self._set_interpolate_mpv(on)
         self._gpu_status.set(f"✓ フレーム補間: {'ON' if on else 'OFF'}")
         self._save_gpu_settings()
@@ -2358,14 +3149,17 @@ class VideoPlayer:
         if on and self._denoise:
             # hqdn3d(ソフトウェア)とamf_frc(GPUサーフェス直結)は同時使用不可のため排他化
             self._denoise = False
-            self._denoise_btn.config(text="🔇 ノイズ軽減: OFF", fg=COL_TXT)
+            self._denoise_btn.config(text="ノイズ軽減: OFF", fg=COL_TXT)
+            self._style_toggle_button(self._denoise_btn, False)
         if on and self._gpu_interpolate:
             # フレーム補間とAMD AMFフレーム補間は目的が重複し二重負荷になるため排他化
             self._gpu_interpolate = False
             self._interpolate_btn.config(text="OFF", fg=COL_TXT)
+            self._style_toggle_button(self._interpolate_btn, False)
             self._set_interpolate_mpv(False)
         self._amf_frc_btn.config(text="ON" if on else "OFF",
                                  fg=COL_GRN if on else COL_TXT)
+        self._style_toggle_button(self._amf_frc_btn, on)
         self._apply_vf_chain()
         if on and self.fps > AMF_FRC_MAX_FPS:
             self._gpu_status.set(
@@ -2396,7 +3190,7 @@ class VideoPlayer:
         if show_status:
             self._gpu_status.set(f"✓ Anime4Kプリセット適用: {name}")
         for mname, btn in self._a4k_btns.items():
-            btn.config(fg=COL_GRN if mname == name else COL_TXT)
+            self._set_button_selected(btn, mname == name, "accent")
 
     def _on_gpu_glsl_add(self):
         paths = self._ask_file(filedialog.askopenfilenames,
@@ -2515,6 +3309,7 @@ class VideoPlayer:
         self._deinterlace_btn.config(
             text="ON" if self._gpu_deinterlace else "OFF",
             fg=COL_GRN if self._gpu_deinterlace else COL_TXT)
+        self._style_toggle_button(self._deinterlace_btn, self._gpu_deinterlace)
         try:
             self.player["deinterlace"] = self._gpu_deinterlace
             self._gpu_status.set(
@@ -2562,6 +3357,10 @@ class VideoPlayer:
                           if val == self._gpu_tonemapping)
         self._gpu_tonemap_var.set(cur_tm_lbl)
         self._deinterlace_btn.config(text="OFF", fg=COL_TXT)
+        for button in (self._deband_btn, self._sigmoid_btn, self._correct_ds_btn,
+                       self._interpolate_btn, self._amf_frc_btn,
+                       self._deinterlace_btn):
+            self._style_toggle_button(button, False)
         # MPVに適用
         try:
             self.player["scale"]               = self._gpu_scale
@@ -2704,8 +3503,18 @@ class VideoPlayer:
 
     def _toggle_volume_popup(self):
         if self._volume_popup and self._volume_popup.winfo_exists():
-            self._volume_popup.destroy()
-            self._volume_popup = None
+            self._close_volume_popup()
+            return
+        self._open_volume_popup()
+
+    def _open_volume_popup(self, auto_hide=False):
+        if self._volume_popup and self._volume_popup.winfo_exists():
+            self._volume_popup.focus_force()
+            if auto_hide:
+                if self._volume_popup_after_id:
+                    self.root.after_cancel(self._volume_popup_after_id)
+                self._volume_popup_after_id = self.root.after(
+                    1000, self._close_volume_popup)
             return
         pop = tk.Toplevel(self.root)
         self._volume_popup = pop
@@ -2723,7 +3532,7 @@ class VideoPlayer:
         scale = tk.Scale(pop, from_=100, to=0, orient=tk.VERTICAL,
                          variable=self.vol_var, command=self._on_volume,
                          length=130, showvalue=False, width=12,
-                         bg=BG_ADJ, fg=COL_TXT, troughcolor="#333333",
+                         bg=BG_ADJ, fg=COL_TXT, troughcolor=BG_BORDER,
                          activebackground=COL_BLU, highlightthickness=0,
                          bd=0, sliderlength=14, sliderrelief=tk.FLAT)
         scale.pack(padx=12, pady=(2, 8))
@@ -2734,8 +3543,17 @@ class VideoPlayer:
         y = self._mute_btn.winfo_rooty() - pop.winfo_reqheight() - 4
         pop.geometry(f"+{max(0, x)}+{max(0, y)}")
         pop.focus_force()
+        if auto_hide:
+            self._volume_popup_after_id = self.root.after(
+                1000, self._close_volume_popup)
 
     def _close_volume_popup(self):
+        if self._volume_popup_after_id:
+            try:
+                self.root.after_cancel(self._volume_popup_after_id)
+            except tk.TclError:
+                pass
+            self._volume_popup_after_id = None
         if hasattr(self, "_volume_trace_id"):
             try:
                 self.vol_var.trace_remove("write", self._volume_trace_id)
@@ -2756,6 +3574,7 @@ class VideoPlayer:
         value = max(0, min(100, self.vol_var.get() + step))
         self.vol_var.set(value)
         self._on_volume(value)
+        self._open_volume_popup(auto_hide=True)
         return "break"
 
     def toggle_mute(self):
@@ -2764,7 +3583,8 @@ class VideoPlayer:
             self.player.mute = self._muted
         except Exception:
             pass
-        self._mute_btn.config(text="🔇" if self._muted else "🔊")
+        self._mute_btn.config(text=self._icons["mute"] if self._muted else self._icons["volume"])
+        self._set_button_selected(self._mute_btn, self._muted, "warning")
 
     def _on_volume(self, val):
         v = int(float(val))
@@ -2772,7 +3592,8 @@ class VideoPlayer:
             self._volume_value_label.set(f"{v}%")
         if self._muted and v > 0:
             self._muted = False
-            self._mute_btn.config(text="🔊")
+            self._mute_btn.config(text=self._icons["volume"])
+            self._set_button_selected(self._mute_btn, False)
             try:
                 self.player.mute = False
             except Exception:
@@ -2797,6 +3618,39 @@ class VideoPlayer:
         v = max(0, min(100, self.vol_var.get() + delta))
         self.vol_var.set(v)
         self._apply_volume()
+        self._open_volume_popup(auto_hide=True)
+
+    def _cancel_control_hide(self):
+        if self._control_hide_after_id:
+            try:
+                self.root.after_cancel(self._control_hide_after_id)
+            except tk.TclError:
+                pass
+            self._control_hide_after_id = None
+
+    def _place_control_dock(self):
+        if self.root.attributes("-fullscreen"):
+            self.ctrl_bar.place(relx=0, rely=1.0, anchor="sw",
+                                relwidth=1.0, y=0)
+        else:
+            self.ctrl_bar.place_forget()
+            self.ctrl_bar.pack(fill=tk.X, side=tk.BOTTOM)
+        self.ctrl_bar.lift()
+
+    def _show_main_controls(self, schedule=False):
+        if self.root.attributes("-fullscreen"):
+            return
+        self._cancel_control_hide()
+        self._place_control_dock()
+        self._controls_visible = True
+
+    def _hide_main_controls(self):
+        self._control_hide_after_id = None
+        # Normal playback keeps the v1.8-style bottom bar fixed.  Hiding is
+        # reserved for the fullscreen hover bar.
+
+    def _on_player_motion(self, _event=None):
+        return
 
     # ── フルスクリーン ────────────────────────────────────────────────────
 
@@ -2814,22 +3668,20 @@ class VideoPlayer:
             self._exit_fullscreen_ui()
 
     def _enter_fullscreen_ui(self):
-        # 通常配置(pack)から外し、映像を画面いっぱいにする。
-        # 操作バーはマウス操作/右クリック時だけ上に重ねて(place)一時表示する。
+        # Hide the normal dock so fullscreen starts with a clean video surface.
+        self._cancel_control_hide()
         self.ctrl_bar.pack_forget()
         self._fs_bar_visible = False
         self._fs_hide_after_id = None
         self.root.bind("<Motion>", self._on_fullscreen_motion, add="+")
-        self.root.bind("<Button-3>", self._on_fullscreen_rclick, add="+")
 
     def _exit_fullscreen_ui(self):
         self.root.unbind("<Motion>")
-        self.root.unbind("<Button-3>")
         if self._fs_hide_after_id:
             self.root.after_cancel(self._fs_hide_after_id)
             self._fs_hide_after_id = None
         self.ctrl_bar.place_forget()
-        self.ctrl_bar.pack(fill=tk.X, side=tk.BOTTOM)
+        self._show_main_controls(schedule=True)
 
     def _on_fullscreen_motion(self, event):
         if not self.root.attributes("-fullscreen"):
@@ -2845,8 +3697,7 @@ class VideoPlayer:
 
     def _show_fullscreen_bar(self):
         if not self._fs_bar_visible:
-            self.ctrl_bar.place(relx=0, rely=1.0, anchor="sw", relwidth=1.0)
-            self.ctrl_bar.lift()
+            self._place_control_dock()
             self._fs_bar_visible = True
         if self._fs_hide_after_id:
             self.root.after_cancel(self._fs_hide_after_id)
@@ -2897,7 +3748,7 @@ class VideoPlayer:
             self._on_adjust(key)
         self._picture_mode = name
         for mname, btn in self._mode_btns.items():
-            btn.config(fg=COL_GRN if mname == name else COL_TXT)
+            self._set_button_selected(btn, mname == name, "accent")
 
     def _load_rt_mode(self):
         """起動時に adj_settings_mpv.json から rt_mode のみ復元する。
@@ -3000,11 +3851,12 @@ class VideoPlayer:
         if on and self._gpu_amf_frc:
             self._gpu_amf_frc = False
             self._amf_frc_btn.config(text="OFF", fg=COL_TXT)
+            self._style_toggle_button(self._amf_frc_btn, False)
             self._save_gpu_settings()
         self._apply_vf_chain()
         self._denoise_btn.config(
-            text=f"🔇 ノイズ軽減: {'ON' if on else 'OFF'}",
-            fg=COL_GRN if on else COL_TXT)
+            text=f"ノイズ軽減: {'ON' if on else 'OFF'}")
+        self._set_button_selected(self._denoise_btn, on, "success")
 
     # ── DnD ──────────────────────────────────────────────────────────────
 
@@ -3054,8 +3906,10 @@ class VideoPlayer:
         except Exception:
             pass
         self._ab_state = 0
-        self._ab_btn.config(text="A-B", fg=COL_TXT)
+        self._ab_btn.config(text="A-B")
+        self._set_button_selected(self._ab_btn, False)
         self.root.title(f"Lumveil — {os.path.basename(path)}")
+        self._show_main_controls(schedule=True)
         self.root.after(600, self._fetch_fps)
         self._add_recent_file(path)
         if not _from_playlist:
@@ -3126,7 +3980,8 @@ class VideoPlayer:
             except Exception:
                 pass
             self._ab_state = 1
-            self._ab_btn.config(text="A-B: A", fg=COL_YEL)
+            self._ab_btn.config(text="A-B: A")
+            self._set_button_selected(self._ab_btn, True, "warning")
         elif self._ab_state == 1:
             if pos is None:
                 return
@@ -3135,7 +3990,8 @@ class VideoPlayer:
             except Exception:
                 pass
             self._ab_state = 2
-            self._ab_btn.config(text="A-B: ▶", fg=COL_GRN)
+            self._ab_btn.config(text="A-B: ON")
+            self._set_button_selected(self._ab_btn, True, "success")
         else:
             try:
                 self.player["ab-loop-a"] = "no"
@@ -3143,7 +3999,8 @@ class VideoPlayer:
             except Exception:
                 pass
             self._ab_state = 0
-            self._ab_btn.config(text="A-B", fg=COL_TXT)
+            self._ab_btn.config(text="A-B")
+            self._set_button_selected(self._ab_btn, False)
 
     def _fetch_fps(self):
         try:
@@ -3256,10 +4113,27 @@ class VideoPlayer:
     def _on_seekbar_motion(self, event):
         if not self._current_path or not FFMPEG:
             return
+        # Show the preview shell immediately while thumbnail extraction stays
+        # deferred briefly to avoid starting ffmpeg for every mouse event.
+        self._show_preview_shell(event.x)
         if self._prev_after_id:
             self.root.after_cancel(self._prev_after_id)
         self._prev_after_id = self.root.after(
-            120, lambda x=event.x: self._schedule_preview(x))
+            20, lambda x=event.x: self._schedule_preview(x))
+
+    def _show_preview_shell(self, hover_x):
+        dur_ms = self._get_duration_ms()
+        if dur_ms <= 0:
+            return
+        w = self.seekbar.winfo_width()
+        ratio = max(0.0, min(1.0, hover_x / max(w, 1)))
+        pos_ms = int(ratio * dur_ms)
+        self.prev_time_label.config(text=self._fmt(pos_ms))
+        rx = self.seekbar.winfo_rootx() + hover_x - PREV_W // 2
+        ry = self.seekbar.winfo_rooty() - PREV_H - 30
+        self.prev_popup.geometry(f"{PREV_W}x{PREV_H + 22}+{rx}+{ry}")
+        self.prev_popup.deiconify()
+        self.prev_popup.lift()
 
     def _schedule_preview(self, hover_x):
         dur_ms = self._get_duration_ms()
@@ -3270,6 +4144,7 @@ class VideoPlayer:
         pos_ms  = int(ratio * dur_ms)
         pos_sec = pos_ms / 1000.0
         key     = (self._current_path, int(pos_sec / SNAP_STEP))
+        self._preview_key = key
 
         self.prev_time_label.config(text=self._fmt(pos_ms))
         rx = self.seekbar.winfo_rootx() + hover_x - PREV_W // 2
@@ -3280,12 +4155,16 @@ class VideoPlayer:
 
         cached = self._thumb_cache.get(key)
         if cached:
+            self._preview_pending_key = None
             self._apply_preview_img(cached)
             return
 
+        if self._preview_pending_key == key:
+            return
         self._prev_cancel.set()
         cancel = threading.Event()
         self._prev_cancel = cancel
+        self._preview_pending_key = key
         threading.Thread(target=self._gen_preview_bg,
                          args=(self._current_path, pos_sec, key, cancel),
                          daemon=True).start()
@@ -3297,6 +4176,9 @@ class VideoPlayer:
         self.root.after(0, lambda i=img, k=key: self._finalize_preview(i, k))
 
     def _finalize_preview(self, img_pil, key):
+        if key != self._preview_key:
+            return
+        self._preview_pending_key = None
         photo = ImageTk.PhotoImage(img_pil)
         self._thumb_cache.put(key, photo)
         self._apply_preview_img(photo)
@@ -3310,6 +4192,9 @@ class VideoPlayer:
         if self._prev_after_id:
             self.root.after_cancel(self._prev_after_id)
             self._prev_after_id = None
+        self._prev_cancel.set()
+        self._preview_key = None
+        self._preview_pending_key = None
         self.prev_popup.withdraw()
 
     # ── 動画クリック（ポーリング）─────────────────────────────────────────
@@ -3344,14 +4229,14 @@ class VideoPlayer:
         # 全画面時は操作バーが映像の上にオーバーレイ表示される（place）ため、
         # 表示中はタイトルバーなしのウィンドウ内子要素として矩形判定する。
         try:
-            bar = self.ctrl_bar
-            if bar.winfo_viewable():
-                ox = bar.winfo_rootx()
-                oy = bar.winfo_rooty()
-                ow = bar.winfo_width()
-                oh = bar.winfo_height()
-                if ox <= px <= ox + ow and oy <= py <= oy + oh:
-                    return True
+            for overlay in (getattr(self, "ctrl_bar", None),):
+                if overlay and overlay.winfo_viewable():
+                    ox = overlay.winfo_rootx()
+                    oy = overlay.winfo_rooty()
+                    ow = overlay.winfo_width()
+                    oh = overlay.winfo_height()
+                    if ox <= px <= ox + ow and oy <= py <= oy + oh:
+                        return True
         except Exception:
             pass
         TITLE_H = 35
@@ -3433,6 +4318,7 @@ class VideoPlayer:
         self.root.bind("i",         lambda e: self.player.command("script-binding", "stats/display-stats-toggle"))
         self.root.bind("I",         lambda e: self.player.command("script-binding", "stats/display-stats-toggle"))
         self.root.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.root.bind_all("<Button-3>", self._on_right_click)
 
     def _on_mousewheel(self, event):
         handler = getattr(self, "_advanced_wheel_handler", None)
@@ -3472,12 +4358,12 @@ class VideoPlayer:
         current = self._rt_mode if self._rt_enabled else "OFF"
         if self._rt_mode_btns:
             for mname, btn in self._rt_mode_btns.items():
-                btn.config(fg=COL_GRN if mname == current else COL_TXT)
+                self._set_button_selected(btn, mname == current, "accent")
         if hasattr(self, "_auto_btn"):
-            # モード名を連結するとボタン幅からはみ出すため、テキストは固定し
-            # 文字色でモードを示す。
-            self._auto_btn.config(text="⚡ AUTO",
-                                  fg=RT_MODE_COLORS.get(current, COL_TXT))
+            # AUTO is a state chip: the active mode is visible without opening a menu.
+            toolbar_label = RT_MODE_TOOLBAR_LABELS.get(current, current)
+            self._auto_btn.config(text=f"AUTO · {toolbar_label}")
+            self._set_button_selected(self._auto_btn, current != "OFF", "accent")
 
     def _show_auto_menu(self):
         """⚡AUTOボタンからAUTO強度モードを直接選択するポップアップメニュー。"""
@@ -3503,7 +4389,8 @@ class VideoPlayer:
         if self._rt_enabled:
             self._rt_enabled = False
             self._rt_stop.set()
-            self._rt_btn.config(text="⚡ リアルタイム自動調整: OFF", fg=COL_TXT)
+            self._rt_btn.config(text="リアルタイム自動調整: OFF")
+            self._set_button_selected(self._rt_btn, False)
             self._auto_adj_status.set("")
             self._sync_rt_mode_buttons()
             if self._pre_rt_adj:
@@ -3540,7 +4427,8 @@ class VideoPlayer:
             self._apply_glsl_shaders()
             if hasattr(self, "_shadow_lift_scale"):
                 self._shadow_lift_scale.config(state=tk.DISABLED)
-            self._rt_btn.config(text="⚡ リアルタイム自動調整: ON", fg=COL_GRN)
+            self._rt_btn.config(text="リアルタイム自動調整: ON")
+            self._set_button_selected(self._rt_btn, True, "success")
             self._auto_adj_status.set("ベースライン解析中...")
             self._sync_rt_mode_buttons()
             self._rt_thread = threading.Thread(target=self._rt_loop, daemon=True)
@@ -3839,10 +4727,9 @@ class VideoPlayer:
             td = self._fmt(int(dur_ms))
             self.time_var.set(tc)
             self.dur_var.set(td)
-            self._time_btn_var.set(f"{tc} / {td}")
 
         is_playing = (self._cached_pause is False)
-        new_icon = "⏸" if is_playing else "▶"
+        new_icon = self._icons["pause"] if is_playing else self._icons["play"]
         if self.play_btn.cget("text") != new_icon:
             self.play_btn.config(text=new_icon)
 
