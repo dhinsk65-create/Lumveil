@@ -92,6 +92,16 @@ AMD GPU内蔵の専用ハードウェアで、動きを解析して本物の中�
 
 `Lumveil_v2.1.0_Setup.exe` を実行してください。既定のインストール先は `C:\Program Files\Lumveil` です。
 
+### インストール時のWindows警告について（v2.1）
+
+現在のv2.1インストーラーは**コード署名を付けていません**。ダウンロード後の初回起動時に、Microsoft Defender SmartScreenの「WindowsによってPCが保護されました」が表示される場合があります。未署名・配布実績が少ないファイルに対する警告であり、この表示だけでウイルスが検出されたことを意味するものではありません。ただし、安全性の保証でもありません。別のPCや次のバージョンでも表示される場合があります。
+
+1. [公式GitHub Releasesのv2.1.0ページ](https://github.com/dhinsk65-create/Lumveil/releases/tag/v2.1.0)から、`Lumveil_v2.1.0_Setup.exe`と`SHA256SUMS.txt`を入手してください。
+2. PowerShellで`Get-FileHash -LiteralPath .\Lumveil_v2.1.0_Setup.exe -Algorithm SHA256`を実行し、結果が同じリリースの`SHA256SUMS.txt`と一致することを確認してください。ハッシュ照合は配布ファイルとの一致を確認するもので、安全性を保証するものではありません。
+3. 配布元とファイルの一致を確認し、実行を信頼できると判断した場合に限り、警告画面の「詳細情報」→「実行」から進められます。不明な配布元・ハッシュ不一致・別のウイルス検出警告がある場合は実行しないでください。
+
+SmartScreenやウイルス対策を無効化する必要はありません。詳細は[MicrosoftのSmartScreen説明](https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/smartscreen-reputation)を参照してください。
+
 ---
 
 ## ファイル関連付け
