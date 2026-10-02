@@ -5,8 +5,9 @@ Video Player MPV版  ―  YouTube スタイル UI
         → https://mpv.io/installation/ の "Windows" から入手
   pip install python-mpv pillow tkinterdnd2
 """
-import os, sys, shutil, subprocess, threading, time, math, json, ctypes
-import hashlib, re, tempfile, urllib.error, urllib.request, webbrowser
+import os, sys, shutil, subprocess, threading, time, math, json, ctypes, queue
+import base64, hashlib, re, tempfile, urllib.error, urllib.request, webbrowser
+from ctypes import wintypes
 
 # libmpv-2.dll をスクリプトと同じフォルダから確実に読み込む
 os.environ["PATH"] = os.path.dirname(os.path.abspath(__file__)) + os.pathsep + os.environ["PATH"]
@@ -23,7 +24,7 @@ SEEK_SEC       = 5
 PREV_W, PREV_H = 192, 108
 CACHE_MAX      = 30
 SNAP_STEP      = 2
-APP_VERSION     = "2.0.0"
+APP_VERSION     = "2.1.0"
 GITHUB_REPO     = "dhinsk65-create/Lumveil"
 GITHUB_URL      = f"https://github.com/{GITHUB_REPO}"
 UPDATE_CHECK_INTERVAL = 6 * 60 * 60
@@ -31,9 +32,25 @@ AMF_FRC_MAX_FPS = 50.0  # 元動画がこれを超えるfpsならAMD AMFフレ�
 FFMPEG         = shutil.which("ffmpeg")
 
 _SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
-_RT_CONTRAST_SHADER_PATH = os.path.join(_SCRIPT_DIR, "shaders", "lumveil_auto_contrast.glsl")
-_RT_SHADOW_SHADER_PATH  = os.path.join(_SCRIPT_DIR, "shaders", "lumveil_shadow_lift.glsl")
-_SHADER_DIR     = os.path.join(_SCRIPT_DIR, "shaders")
+
+
+def _resource_dir(name, script_dir=None, executable=None, frozen=None):
+    """Resolve external release assets as well as bundled/development assets."""
+    script_dir = script_dir if script_dir is not None else _SCRIPT_DIR
+    executable = executable if executable is not None else sys.executable
+    frozen = frozen if frozen is not None else getattr(sys, "frozen", False)
+    candidates = []
+    if frozen:
+        candidates.append(os.path.join(os.path.dirname(executable), name))
+    candidates.append(os.path.join(script_dir, name))
+    if frozen:
+        candidates.append(os.path.join(os.path.dirname(executable), "_internal", name))
+    return next((path for path in candidates if os.path.isdir(path)), candidates[0])
+
+
+_SHADER_DIR = _resource_dir("shaders")
+_RT_CONTRAST_SHADER_PATH = os.path.join(_SHADER_DIR, "lumveil_auto_contrast.glsl")
+_RT_SHADOW_SHADER_PATH = os.path.join(_SHADER_DIR, "lumveil_shadow_lift.glsl")
 
 if not FFMPEG:
     for _ffmpeg_candidate in (
@@ -83,6 +100,62 @@ PLAYER_SETTINGS = os.path.join(_BASE_DIR, "player_settings.json")
 WINDOW_SETTINGS = os.path.join(_BASE_DIR, "window_settings.json")
 BOOKMARKS_FILE  = os.path.join(_BASE_DIR, "bookmarks.json")
 
+
+def _atomic_write_json(path, data, **kwargs):
+    """Keep the previous settings intact until a complete new file is durable."""
+    path = os.path.abspath(path)
+    fd, temporary = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.",
+                                     suffix=".tmp", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            json.dump(data, output, **kwargs)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _bounded_number(value, default, lo, hi):
+    try:
+        number = float(value)
+        return max(lo, min(hi, number)) if math.isfinite(number) else default
+    except (ValueError, TypeError, OverflowError):
+        return default
+
+
+def _parse_seek_time(value):
+    """Accept seconds, mm:ss, or hh:mm:ss, without silently accepting typos."""
+    parts = str(value).strip().split(":")
+    if not 1 <= len(parts) <= 3 or any(not re.fullmatch(r"\d+(?:\.\d+)?", p) for p in parts):
+        raise ValueError("秒、分:秒、時:分:秒で入力してください。")
+    numbers = [float(p) for p in parts]
+    if any(not math.isfinite(n) for n in numbers) or any(n >= 60 for n in numbers[1:]):
+        raise ValueError("分・秒は60未満で入力してください。")
+    return sum(number * 60 ** i for i, number in enumerate(reversed(numbers)))
+
+
+def _launch_installer_after_exit(path, digest):
+    """A separate system process waits for this executable to release its files."""
+    if not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest or ""):
+        raise ValueError("インストーラーの検証情報がありません。")
+    quoted_path = os.path.abspath(path).replace("'", "''")
+    script = (
+        f"$target = '{quoted_path}'; "
+        f"Wait-Process -Id {os.getpid()} -Timeout 30 -ErrorAction SilentlyContinue; "
+        f"if (Get-Process -Id {os.getpid()} -ErrorAction SilentlyContinue) {{ exit 1 }}; "
+        f"if ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -ne '{digest[7:]}') {{ exit 2 }}; "
+        "Start-Process -FilePath $target"
+    )
+    powershell = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                             "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+    encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    return subprocess.Popen([powershell, "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+                            creationflags=subprocess.CREATE_NO_WINDOW)
+
 # MPV 画像調整パラメータ（整数 -100〜100、デフォルト 0）
 ADJ_PARAMS = [
     ("brightness", "輝度",          -100, 100, 0),
@@ -115,6 +188,215 @@ VIDEO_EXTS = {
     ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v",
     ".ts", ".m2ts", ".vob", ".ogv", ".3gp", ".rmvb", ".rm", ".hevc", ".h264",
 }
+EOF_ACTION_OPTIONS = {"停止": "stop", "次の動画を再生": "next", "リピート": "repeat"}
+
+# The desktop build uses a per-session mutex and a local named pipe so opening
+# a second file reuses the already visible player instead of creating another
+# mpv/Tk process.  The pipe carries only UTF-8 JSON file paths and never
+# exposes a network port.
+_SINGLE_INSTANCE_MUTEX = r"Local\Lumveil.SingleInstance.v1"
+_SINGLE_INSTANCE_PIPE  = r"\\.\pipe\Lumveil.SingleInstance.v1"
+_SINGLE_INSTANCE_MAX_MESSAGE = 64 * 1024
+_MPV_EVENT_PENDING = object()
+
+
+class _SingleInstance:
+    """Keep one Lumveil process per Windows desktop session.
+
+    The primary process owns a named mutex and a short-lived named-pipe
+    listener.  A later process forwards its file arguments and exits.  The
+    implementation is deliberately best-effort on non-Windows platforms so
+    source development remains possible there without adding a dependency.
+    """
+
+    _ERROR_ALREADY_EXISTS = 183
+    _ERROR_PIPE_BUSY = 231
+    _ERROR_PIPE_CONNECTED = 535
+    _GENERIC_WRITE = 0x40000000
+    _OPEN_EXISTING = 3
+    _FILE_ATTRIBUTE_NORMAL = 0x80
+    _PIPE_ACCESS_INBOUND = 0x00000001
+    _PIPE_TYPE_MESSAGE = 0x00000004
+    _PIPE_READMODE_MESSAGE = 0x00000002
+    _PIPE_WAIT = 0x00000000
+
+    def __init__(self, primary, kernel32=None, mutex_handle=None):
+        self.primary = primary
+        self._kernel32 = kernel32
+        self._mutex_handle = mutex_handle
+        self._stop_event = threading.Event()
+        self._server_thread = None
+
+    @staticmethod
+    def _valid_handle(handle):
+        value = getattr(handle, "value", handle)
+        invalid = ctypes.c_void_p(-1).value
+        return value not in (None, 0, -1, invalid)
+
+    @classmethod
+    def acquire(cls):
+        if sys.platform != "win32":
+            return cls(True)
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateMutexW.argtypes = [
+                wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+            kernel32.CreateMutexW.restype = wintypes.HANDLE
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            kernel32.GetLastError.restype = wintypes.DWORD
+            kernel32.CreateNamedPipeW.argtypes = [
+                wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+                wintypes.DWORD, wintypes.LPVOID]
+            kernel32.CreateNamedPipeW.restype = wintypes.HANDLE
+            kernel32.ConnectNamedPipe.argtypes = [wintypes.HANDLE, wintypes.LPVOID]
+            kernel32.ConnectNamedPipe.restype = wintypes.BOOL
+            kernel32.DisconnectNamedPipe.argtypes = [wintypes.HANDLE]
+            kernel32.DisconnectNamedPipe.restype = wintypes.BOOL
+            kernel32.ReadFile.argtypes = [
+                wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
+            kernel32.ReadFile.restype = wintypes.BOOL
+            kernel32.CreateFileW.argtypes = [
+                wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
+                wintypes.HANDLE]
+            kernel32.CreateFileW.restype = wintypes.HANDLE
+            kernel32.WriteFile.argtypes = [
+                wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
+            kernel32.WriteFile.restype = wintypes.BOOL
+            kernel32.WaitNamedPipeW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
+            kernel32.WaitNamedPipeW.restype = wintypes.BOOL
+
+            mutex = kernel32.CreateMutexW(
+                None, False, _SINGLE_INSTANCE_MUTEX)
+            if not cls._valid_handle(mutex):
+                # Failing open keeps unsupported/locked-down Windows builds
+                # usable; normal Windows builds always take the mutex path.
+                return cls(True, kernel32)
+            if ctypes.get_last_error() == cls._ERROR_ALREADY_EXISTS:
+                kernel32.CloseHandle(mutex)
+                return cls(False, kernel32)
+            return cls(True, kernel32, mutex)
+        except Exception:
+            # The app has historically started without any single-instance
+            # dependency.  Preserve that fallback if Win32 setup is blocked.
+            return cls(True)
+
+    def start_server(self, message_queue):
+        if not (self.primary and self._mutex_handle and self._kernel32):
+            return
+        self._server_thread = threading.Thread(
+            target=self._server_loop,
+            args=(message_queue,),
+            name="LumveilSingleInstance",
+            daemon=True,
+        )
+        self._server_thread.start()
+
+    def _server_loop(self, message_queue):
+        kernel32 = self._kernel32
+        while not self._stop_event.is_set():
+            pipe = kernel32.CreateNamedPipeW(
+                _SINGLE_INSTANCE_PIPE,
+                self._PIPE_ACCESS_INBOUND,
+                self._PIPE_TYPE_MESSAGE | self._PIPE_READMODE_MESSAGE | self._PIPE_WAIT,
+                1,
+                _SINGLE_INSTANCE_MAX_MESSAGE,
+                _SINGLE_INSTANCE_MAX_MESSAGE,
+                1000,
+                None,
+            )
+            if not self._valid_handle(pipe):
+                time.sleep(0.05)
+                continue
+            try:
+                connected = bool(kernel32.ConnectNamedPipe(pipe, None))
+                if not connected and ctypes.get_last_error() != self._ERROR_PIPE_CONNECTED:
+                    continue
+                buffer = ctypes.create_string_buffer(_SINGLE_INSTANCE_MAX_MESSAGE)
+                read = wintypes.DWORD()
+                if not kernel32.ReadFile(
+                        pipe, buffer, _SINGLE_INSTANCE_MAX_MESSAGE,
+                        ctypes.byref(read), None):
+                    continue
+                try:
+                    payload = json.loads(buffer.raw[:read.value].decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if payload.get("shutdown"):
+                    self._stop_event.set()
+                    continue
+                paths = payload.get("paths")
+                if payload.get("bring_to_front") and isinstance(paths, list):
+                    message_queue.put([
+                        os.path.abspath(path) for path in paths
+                        if isinstance(path, str)
+                    ])
+            finally:
+                try:
+                    kernel32.DisconnectNamedPipe(pipe)
+                except Exception:
+                    pass
+                kernel32.CloseHandle(pipe)
+
+    def _send_payload(self, payload, timeout=3.0):
+        if not self._kernel32:
+            return False
+        try:
+            raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        except (TypeError, ValueError):
+            return False
+        if len(raw) > _SINGLE_INSTANCE_MAX_MESSAGE:
+            return False
+        deadline = time.monotonic() + timeout
+        kernel32 = self._kernel32
+        while time.monotonic() < deadline:
+            pipe = kernel32.CreateFileW(
+                _SINGLE_INSTANCE_PIPE,
+                self._GENERIC_WRITE,
+                0,
+                None,
+                self._OPEN_EXISTING,
+                self._FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+            if self._valid_handle(pipe):
+                try:
+                    written = wintypes.DWORD()
+                    buffer = ctypes.create_string_buffer(raw)
+                    return bool(kernel32.WriteFile(
+                        pipe, buffer, len(raw), ctypes.byref(written), None)
+                        and written.value == len(raw))
+                finally:
+                    kernel32.CloseHandle(pipe)
+            if ctypes.get_last_error() == self._ERROR_PIPE_BUSY:
+                kernel32.WaitNamedPipeW(_SINGLE_INSTANCE_PIPE, 100)
+            else:
+                time.sleep(0.05)
+        return False
+
+    def forward_paths(self, paths):
+        return self._send_payload({
+            "bring_to_front": True,
+            "paths": list(paths),
+        })
+
+    def close(self):
+        if not self.primary:
+            return
+        self._stop_event.set()
+        # The listener is a daemon thread and Windows releases its named pipe
+        # handles when this process exits.  Do not send a synchronous wake-up
+        # message or join here: shutdown must never wait on the IPC path.
+        if self._valid_handle(self._mutex_handle):
+            try:
+                self._kernel32.CloseHandle(self._mutex_handle)
+            except Exception:
+                pass
+            self._mutex_handle = None
 
 
 # Lumveil v2.0 palette. The video surface remains near-black so the content
@@ -330,6 +612,9 @@ def analyze_current_frame(player, dark_thresh=60, crush_thresh=25):
 class VideoPlayer:
     def __init__(self, root: TkinterDnD.Tk):
         self.root = root
+        self._closing = False
+        self._scroll_wheel_handlers = []
+        self._ui_dispatch_queue = queue.Queue()
         self.root.title("Lumveil")
         self.root.configure(bg=BG_APP)
         self.root.minsize(720, 460)
@@ -338,6 +623,11 @@ class VideoPlayer:
         # RT 自動調整（MPV整数空間で計算: 0=中立）
         self._rt_enabled  = False
         self._rt_stop     = threading.Event()
+        self._rt_generation = 0
+        self._rt_baseline_cache = {}
+        self._rt_baseline_cache_lock = threading.Lock()
+        self._rt_applied_values = {}
+        self._rt_analysis_revision = 0
         self._rt_targets  = {k: 0.0 for k in ("brightness", "contrast", "gamma", "saturation")}
         self._rt_current  = {k: 0.0 for k in ("brightness", "contrast", "gamma", "saturation")}
         # AUTO開始時の手動調整値。暗所補正はこの値を打ち消さず、補正分だけを加算する。
@@ -347,6 +637,9 @@ class VideoPlayer:
         self._rt_current["shadow_lift"] = 0.0
         self._rt_baseline = None
         self._rt_thread   = None
+        self._rt_threads = []
+        self._manual_status_stats = None
+        self._manual_status_pending = False
         self._dark_thresh = 1.0
         self._pre_rt_adj  = None
         self._rt_mode     = "標準"
@@ -356,6 +649,7 @@ class VideoPlayer:
 
         # GLSLシェーダーへ渡すパラメータの一元管理（個別にsetすると互いに上書きし合うため）
         self._shader_opts = {"auto_contrast": 0.0, "shadow_lift": 0.0}
+        self._last_shader_opts = None
 
         self._denoise = False
 
@@ -376,16 +670,19 @@ class VideoPlayer:
         self._quality_preset  = "カスタム"
         self._applying_quality_preset = False
         self._load_gpu_settings()
-        # AUTO強度モードのみ起動時に自動復元する（スライダー値は手動読込ボタン
-        # 経由でのみ復元する既存挙動を維持）。AUTO自体は自動開始しない。
+        # AUTO強度を先に復元。手動画質はUI構築後に復元し、AUTOは開始しない。
         self._load_rt_mode()
 
         self._thumb_cache   = ThumbnailCache()
         self._prev_after_id = None
-        self._prev_cancel   = threading.Event()
         self._prev_img_ref  = None
+        self._preview_condition = threading.Condition()
+        self._preview_job = None
+        self._preview_worker = None
+        self._preview_worker_stop = threading.Event()
 
         self._current_path = None
+        self._media_generation = 0
         self._bookmarks    = self._load_bookmarks()
         self._shot_dir     = os.path.join(_BASE_DIR, "Screenshots")
         self._native_dialog_open = False
@@ -402,6 +699,7 @@ class VideoPlayer:
         self._always_on_top = False
         self._playlist      = []
         self._playlist_idx  = -1
+        self._playlist_scan_token = 0
         self._playlist_popup = None
         self._quality_popup = None
         self._auto_update_checks = False
@@ -412,8 +710,10 @@ class VideoPlayer:
         self._preview_key = None
         self._preview_pending_key = None
         # 再生設定（初期値は従来の挙動を維持）
-        self._playback_eof_action = "next"   # next / stop
+        self._playback_eof_action = "next"   # next / stop / repeat (current file)
         self._resume_enabled      = True
+        self._restore_manual_settings = True
+        self._sync_preferences = {}
         self._folder_end_action   = "stop"   # stop / loop
         self._playlist_sort       = "name"   # name / modified
         self._ab_state      = 0   # 0=未設定 1=A地点設定済み 2=ループ中
@@ -436,6 +736,8 @@ class VideoPlayer:
         self._toolbar_items = {}
         self._toolbar_auto_hidden = set()
         self._toolbar_resize_after = None
+        self._gpu_settings_built = False
+        self._gpu_save_after_id = None
 
         self._build_ui()
         self.root.update()  # canvas を確実に実体化してから winfo_id を取得
@@ -463,34 +765,49 @@ class VideoPlayer:
         # time-posは再生中ほぼ毎フレーム変化し通知が来すぎるため、従来通り
         # 定期ポーリング（_get_time_ms）のままにしている。
         self._cached_duration_ms = 0.0
+        self._cached_time_ms     = 0.0
         self._cached_pause       = True
         self._mpv_observer_fns   = []
+        # python-mpv invokes property/event callbacks on its own event thread.
+        # Never call Tk from that thread: Tcl may synchronously wait for the
+        # main loop, which can deadlock against terminate() during shutdown.
+        self._mpv_event_lock = threading.Lock()
+        self._mpv_pending_duration = _MPV_EVENT_PENDING
+        self._mpv_pending_pause = _MPV_EVENT_PENDING
+        self._mpv_pending_eof = None
+        self._mpv_pending_file_loaded = False
+        self._mpv_active_load = None
 
         @self.player.property_observer("duration")
         def _obs_duration(_name, value):
-            self.root.after(0, self._on_duration_prop, value)
+            with self._mpv_event_lock:
+                self._mpv_pending_duration = value
         self._mpv_observer_fns.append(_obs_duration)
 
         @self.player.property_observer("pause")
         def _obs_pause(_name, value):
-            self.root.after(0, self._on_pause_prop, value)
+            with self._mpv_event_lock:
+                self._mpv_pending_pause = value
         self._mpv_observer_fns.append(_obs_pause)
 
         # 連続再生: ファイル終端に達したらプレイリストの次のファイルへ自動移行
         @self.player.property_observer("eof-reached")
         def _obs_eof(_name, value):
-            if value:
-                self.root.after(0, self._on_eof_reached)
+            self._on_mpv_eof(value)
         self._mpv_observer_fns.append(_obs_eof)
 
         self._load_player_settings()
+        self._apply_playback_eof_action()
 
         # ファイルロード後に調整値・GPU設定を再適用
         self.player.event_callback("file-loaded")(self._on_mpv_file_loaded)
+        self.player.event_callback("start-file")(self._on_mpv_start_file)
+        self.player.event_callback("end-file")(self._on_mpv_end_file)
         self._apply_gpu_settings()
 
         self._build_adj_win()
-        self._build_gpu_win()
+        if self._restore_manual_settings:
+            self._load_adj(quiet=True)
         self.root.after(2500, self._maybe_check_updates)
         self._bind_keys()
         self._setup_dnd()
@@ -502,14 +819,20 @@ class VideoPlayer:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _on_close(self):
-        self._update_resume_position()
-        self._save_window_settings()
+        if self._closing:
+            return
+        self._closing = True
+        self._playlist_scan_token += 1
+        # Persisting settings must never prevent native cleanup/window close.
+        for save in (self._update_resume_position, self._save_window_settings,
+                     lambda: self._save_adj(quiet=True)):
+            try:
+                save()
+            except Exception:
+                pass
         self._rt_enabled = False
+        self._rt_generation += 1
         self._rt_stop.set()
-        # AUTO自動補正のスレッドはplayer.screenshot_raw()でmpvに直接アクセスするため、
-        # 完全に停止してからterminate()しないとメインスレッドと競合してフリーズする。
-        if self._rt_thread and self._rt_thread.is_alive():
-            self._rt_thread.join(timeout=2.0)
         # property_observerを解除せずにterminate()すると、mpvのイベントスレッドと
         # デッドロックしてアプリが終了不能になることを確認済み。必ず先に解除する。
         for fn in self._mpv_observer_fns:
@@ -517,17 +840,46 @@ class VideoPlayer:
                 fn.unobserve_mpv_properties()
             except Exception:
                 pass
+        if self._gpu_save_after_id is not None:
+            try:
+                self.root.after_cancel(self._gpu_save_after_id)
+            except tk.TclError:
+                pass
+            self._gpu_save_after_id = None
+            self._save_gpu_settings()
+        self._stop_preview_worker()
+        # terminate() waits indefinitely for python-mpv's event thread.  Keep
+        # that native cleanup off Tk's close callback so a transient mpv/driver
+        # shutdown delay can never leave the window unresponsive.  The RT
+        # worker is allowed a bounded grace period in the same daemon cleanup
+        # thread before terminate() touches the player handle.
+        player = self.player
+        self.player = None
+        rt_threads = list(self._rt_threads)
+        if player:
+            threading.Thread(
+                target=self._terminate_player_after_close,
+                args=(player, rt_threads),
+                name="LumveilMpvShutdown",
+                daemon=True,
+            ).start()
+        self.root.destroy()
+
+    @staticmethod
+    def _terminate_player_after_close(player, rt_threads):
+        deadline = time.monotonic() + 5.0
+        for thread in rt_threads:
+            if thread is not threading.current_thread() and thread.is_alive():
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
         try:
-            self.player.terminate()
+            player.terminate()
         except Exception:
             pass
-        self.root.destroy()
 
     def _save_window_settings(self):
         try:
             geo = self.root.geometry()  # "WxH+X+Y"
-            with open(WINDOW_SETTINGS, "w", encoding="utf-8") as f:
-                json.dump({"geometry": geo}, f)
+            _atomic_write_json(WINDOW_SETTINGS, {"geometry": geo})
         except Exception:
             pass
 
@@ -535,30 +887,60 @@ class VideoPlayer:
         try:
             with open(PLAYER_SETTINGS, encoding="utf-8") as f:
                 data = json.load(f)
-            vol = max(0, min(100, int(data.get("volume", 80))))
+            if not isinstance(data, dict):
+                return
+            vol = round(_bounded_number(data.get("volume"), 80, 0, 100))
             self.vol_var.set(vol)
             self.player.volume = float(vol)
             shot_dir = data.get("screenshot_dir")
-            if shot_dir:
+            if isinstance(shot_dir, str) and shot_dir:
                 self._shot_dir = shot_dir
-            self._recent_files = data.get("recent_files", [])
-            self._resume_positions = data.get("resume_positions", {})
+            recent = data.get("recent_files", [])
+            self._recent_files = list(dict.fromkeys(
+                path for path in recent if isinstance(path, str) and path
+            ))[:10] if isinstance(recent, list) else []
+            resume = data.get("resume_positions", {})
+            self._resume_positions = {
+                path: value for path, position in resume.items()
+                if isinstance(path, str) and path
+                and type(position) in (int, float)
+                and position >= 0
+                and (value := _bounded_number(position, -1, 0, float("inf"))) >= 0
+            } if isinstance(resume, dict) else {}
+            for key, default in (("always_on_top", False), ("resume_enabled", True),
+                                 ("restore_manual_settings", True), ("auto_update_checks", False)):
+                if not isinstance(data.get(key, default), bool):
+                    data[key] = default
             self._always_on_top = bool(data.get("always_on_top", False))
             self._playback_eof_action = data.get("playback_eof_action", "next")
+            if self._playback_eof_action not in EOF_ACTION_OPTIONS.values():
+                self._playback_eof_action = "next"
             self._resume_enabled = bool(data.get("resume_enabled", True))
+            self._restore_manual_settings = bool(data.get("restore_manual_settings", True))
+            self._sync_preferences = {
+                "sub-delay": _bounded_number(data.get("sub_delay"), 0, -5, 5),
+                "sub-scale": _bounded_number(data.get("sub_scale"), 1, .5, 2),
+                "audio-delay": _bounded_number(data.get("audio_delay"), 0, -5, 5),
+            }
             self._folder_end_action = data.get("folder_end_action", "stop")
+            if self._folder_end_action not in ("stop", "loop"):
+                self._folder_end_action = "stop"
             self._playlist_sort = data.get("playlist_sort", "name")
+            if self._playlist_sort not in ("name", "modified"):
+                self._playlist_sort = "name"
             self._auto_update_checks = bool(data.get("auto_update_checks", False))
-            self._last_update_check = float(data.get("last_update_check", 0.0) or 0.0)
-            ui_layout_version = int(data.get("ui_layout_version", 1) or 1)
+            self._last_update_check = _bounded_number(data.get("last_update_check"), 0, 0, float("inf"))
+            ui_layout_version = round(_bounded_number(data.get("ui_layout_version"), 1, 1, 2))
             saved_toolbar = data.get("toolbar_visible")
             if ui_layout_version >= 2 and isinstance(saved_toolbar, list):
                 valid = set(self._toolbar_item_definitions())
-                self._toolbar_visible = set(saved_toolbar) & valid
+                self._toolbar_visible = {key for key in saved_toolbar
+                                         if isinstance(key, str) and key in valid}
             saved_order = data.get("toolbar_order")
             if ui_layout_version >= 2 and isinstance(saved_order, list):
                 valid = set(self._toolbar_order)
-                ordered = [key for key in saved_order if key in valid]
+                ordered = list(dict.fromkeys(key for key in saved_order
+                                            if isinstance(key, str) and key in valid))
                 self._toolbar_order = ordered + [key for key in self._toolbar_order
                                                  if key not in ordered]
             elif ui_layout_version < 2:
@@ -581,8 +963,7 @@ class VideoPlayer:
 
     def _save_player_settings(self):
         try:
-            with open(PLAYER_SETTINGS, "w", encoding="utf-8") as f:
-                json.dump({
+            _atomic_write_json(PLAYER_SETTINGS, {
                     "volume": self.vol_var.get(),
                     "screenshot_dir": self._shot_dir,
                     "recent_files": self._recent_files,
@@ -592,12 +973,16 @@ class VideoPlayer:
                     "toolbar_order": self._toolbar_order,
                     "playback_eof_action": self._playback_eof_action,
                     "resume_enabled": self._resume_enabled,
+                    "restore_manual_settings": getattr(self, "_restore_manual_settings", True),
+                    "sub_delay": self._sub_delay_var.get() if hasattr(self, "_sub_delay_var") else 0,
+                    "sub_scale": self._sub_scale_var.get() if hasattr(self, "_sub_scale_var") else 1,
+                    "audio_delay": self._audio_delay_var.get() if hasattr(self, "_audio_delay_var") else 0,
                     "folder_end_action": self._folder_end_action,
                     "playlist_sort": self._playlist_sort,
                     "auto_update_checks": self._auto_update_checks,
                     "last_update_check": self._last_update_check,
                     "ui_layout_version": 2,
-                }, f, ensure_ascii=False)
+                }, ensure_ascii=False)
         except Exception as e:
             self._set_settings_error("プレイヤー設定の保存", e)
 
@@ -619,7 +1004,10 @@ class VideoPlayer:
             self._resume_positions.pop(path, None)
             self._save_player_settings()
             return
-        pos_ms = self._get_time_ms()
+        # Do not query mpv synchronously while a file is still opening or the
+        # player is already shutting down.  The 200 ms UI loop keeps this
+        # value current enough for resume playback and makes close reliable.
+        pos_ms = self._cached_time_ms
         dur_ms = self._get_duration_ms()
         pos_sec = pos_ms / 1000.0
         dur_sec = dur_ms / 1000.0
@@ -641,13 +1029,55 @@ class VideoPlayer:
         self._save_player_settings()
 
     def _on_mpv_file_loaded(self, _event):
+        """mpvイベントスレッドからの通知をUIループへ引き渡す。"""
+        with self._mpv_event_lock:
+            self._mpv_pending_file_loaded = True
+
+    def _on_mpv_start_file(self, event):
+        with self._mpv_event_lock:
+            self._mpv_active_load = (event.data.playlist_entry_id,
+                                     self._media_generation, self._current_path)
+
+    def _on_mpv_end_file(self, event):
+        if event.data.reason != 4:  # MPV_END_FILE_REASON_ERROR
+            return
+        with self._mpv_event_lock:
+            load = self._mpv_active_load
+        if not load or load[0] != event.data.playlist_entry_id:
+            return
+        details = event.as_dict(decoder=mpv.strict_decoder)
+        reason = details.get("file_error") or details.get("file-error") or f"再生エラー ({event.data.error})"
+        self._post_ui(self._report_playback_error, load[1], load[2], reason)
+
+    def _report_playback_error(self, generation, path, reason):
+        if self._closing or generation != self._media_generation or path != self._current_path:
+            return
+        message = f"再生できません: {os.path.basename(path)}\n{reason}"
+        self._set_settings_error("動画の再生", reason)
+        self._show_error_popup(message)
+
+    def _handle_mpv_file_loaded(self):
         """ファイルロード後に画像調整値・ノイズ設定・AMFフレーム補間を再適用し、続きの位置へシーク"""
-        self.root.after(200, self._apply_all_adj)
+        if self._closing:
+            return
+        self._after_current_file(200, self._apply_all_adj)
         if self._denoise or self._gpu_amf_frc:
-            self.root.after(300, self._apply_vf_chain)
+            self._after_current_file(300, self._apply_vf_chain)
         resume_sec = self._resume_positions.get(self._current_path) if self._resume_enabled else None
         if resume_sec:
-            self.root.after(200, lambda s=resume_sec: self._resume_seek(s))
+            self._after_current_file(200, self._resume_seek, resume_sec)
+
+    def _after_current_file(self, delay_ms, callback, *args):
+        """Discard delayed work when a different load (even of the same file) starts."""
+        generation = self._media_generation
+        path = self._current_path
+
+        def run():
+            if (not self._closing and generation == self._media_generation
+                    and path == self._current_path):
+                callback(*args)
+
+        return self.root.after(delay_ms, run)
 
     def _resume_seek(self, pos_sec):
         try:
@@ -658,6 +1088,7 @@ class VideoPlayer:
     def _apply_all_adj(self):
         for key, *_ in ADJ_PARAMS:
             self._on_adjust(key)
+        self._rt_applied_values.clear()
 
     # ── ボタンヘルパー ────────────────────────────────────────────────────
 
@@ -850,6 +1281,9 @@ class VideoPlayer:
         tk.Label(seek_row, textvariable=self.dur_var,
                  bg=BG_CTRL, fg=COL_DIM,
                  font=("Consolas", 9), width=7).pack(side=tk.LEFT)
+        self._playback_state_var = tk.StringVar(value="")
+        tk.Label(seek_row, textvariable=self._playback_state_var, bg=BG_CTRL,
+                 fg=COL_YEL, font=("Segoe UI", 8)).pack(side=tk.RIGHT, padx=(8, 0))
 
         btn_row = tk.Frame(self.ctrl_bar, bg=BG_CTRL)
         btn_row.pack(fill=tk.X, padx=12, pady=(1, 7))
@@ -1211,7 +1645,6 @@ class VideoPlayer:
         """Open the secondary-action list from the video surface."""
         if self.root.attributes("-fullscreen"):
             self._show_fullscreen_bar()
-            return "break"
         px, py = event.x_root, event.y_root
         cx = self.video_canvas.winfo_rootx()
         cy = self.video_canvas.winfo_rooty()
@@ -1227,14 +1660,16 @@ class VideoPlayer:
         menu = tk.Menu(self.root, tearoff=False, bg=BG_ADJ, fg=COL_TXT,
                        activebackground=BG_BTN_H, activeforeground=COL_TXT,
                        font=("Segoe UI", 9))
-        menu.add_command(label="Play / Pause", command=self.toggle_play)
-        menu.add_command(label="Mute", command=self.toggle_mute)
+        menu.add_command(label="再生 / 一時停止", command=self.toggle_play)
+        menu.add_command(label="ミュート", command=self.toggle_mute)
+        menu.add_command(label="指定時刻へ移動…", command=self._show_time_jump)
+        menu.add_command(label="チャプター…", command=self._show_chapters)
         menu.add_separator()
         secondary = tk.Menu(menu, tearoff=False, bg=BG_ADJ, fg=COL_TXT,
                             activebackground=BG_BTN_H, activeforeground=COL_TXT,
                             font=("Segoe UI", 9))
         self._populate_secondary_menu(secondary)
-        menu.add_cascade(label="Other", menu=secondary)
+        menu.add_cascade(label="その他の操作", menu=secondary)
         try:
             x = event.x_root if event else self.root.winfo_pointerx()
             y = event.y_root if event else self.root.winfo_pointery()
@@ -1250,10 +1685,12 @@ class VideoPlayer:
             label, command = definitions[key]
             menu.add_command(label=label, command=command)
         menu.add_separator()
-        menu.add_command(label="Playback speed", command=self._show_speed_menu)
-        menu.add_command(label="Screenshot options", command=self._show_shot_menu)
+        menu.add_command(label="再生速度", command=self._show_speed_menu)
+        menu.add_command(label="スクリーンショットの設定", command=self._show_shot_menu)
+        menu.add_command(label="再生情報 / GPU使用状態", command=self._show_playback_info)
+        menu.add_command(label="ショートカット一覧", command=self._show_shortcuts)
         menu.add_separator()
-        menu.add_command(label="Customize toolbar", command=self._show_toolbar_settings)
+        menu.add_command(label="操作バーを設定…", command=self._show_toolbar_settings)
 
     def _show_toolbar_menu(self, event=None):
         menu = tk.Menu(self.root, tearoff=False, bg=BG_ADJ, fg=COL_TXT,
@@ -1474,9 +1911,6 @@ class VideoPlayer:
 
     def _show_playlist(self):
         """現在のフォルダまたはD&Dで作られた再生リストを表示する。"""
-        if not self._playlist:
-            self._set_settings_error("再生リストの表示", "動画を開いてください")
-            return
         if self._playlist_popup and self._playlist_popup.winfo_exists():
             self._refresh_playlist_popup()
             self._playlist_popup.deiconify()
@@ -1489,7 +1923,7 @@ class VideoPlayer:
         win.title("再生リスト")
         win.configure(bg=BG_ADJ)
         win.transient(self.root)
-        win.geometry("500x360")
+        win.geometry("540x420")
         win.minsize(360, 240)
         win.protocol("WM_DELETE_WINDOW", self._close_playlist_popup)
         _apply_dark_titlebar(win)
@@ -1514,6 +1948,16 @@ class VideoPlayer:
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self._playlist_listbox.bind("<Double-Button-1>", self._play_selected_from_popup)
         self._playlist_listbox.bind("<Return>", self._play_selected_from_popup)
+
+        edit = tk.Frame(win, bg=BG_ADJ)
+        edit.pack(fill=tk.X, padx=12, pady=(0, 8))
+        for label, callback in (
+            ("追加…", self._playlist_add_files), ("削除", self._playlist_remove_selected),
+            ("↑", lambda: self._playlist_move_selected(-1)),
+            ("↓", lambda: self._playlist_move_selected(1)),
+            ("保存…", self._playlist_save), ("読込…", self._playlist_load),
+        ):
+            self._btn(edit, label, callback, bg=BG_ADJ, pad=(7, 4)).pack(side=tk.LEFT, padx=2)
 
         foot = tk.Frame(win, bg=BG_ADJ)
         foot.pack(fill=tk.X, padx=12, pady=(0, 10))
@@ -1549,7 +1993,8 @@ class VideoPlayer:
         selection = self._playlist_listbox.curselection()
         if not selection:
             return
-        self._play_list(self._playlist, selection[0])
+        self._playlist_idx = selection[0]
+        self._open_path(self._playlist[self._playlist_idx], _from_playlist=True)
         self._close_playlist_popup()
 
     def _playlist_popup_prev(self):
@@ -1559,6 +2004,113 @@ class VideoPlayer:
     def _playlist_popup_next(self):
         self._play_next()
         self._refresh_playlist_popup()
+
+    def _replace_playlist(self, files, *, start_index=None):
+        """Invalidate folder scans and preserve the playing item when editing."""
+        self._playlist_scan_token += 1
+        self._playlist_source = "manual"
+        self._playlist = list(files)
+        current = os.path.normcase(self._current_path or "")
+        self._playlist_idx = next((i for i, p in enumerate(files)
+                                   if os.path.normcase(p) == current), -1)
+        if start_index is not None and files:
+            self._playlist_idx = min(max(0, start_index), len(files) - 1)
+            self._open_path(files[self._playlist_idx], _from_playlist=True)
+        self._refresh_playlist_popup()
+
+    def _playlist_add_files(self):
+        paths = self._ask_file(filedialog.askopenfilenames, title="再生リストに動画を追加",
+                              filetypes=[("動画ファイル", " ".join("*" + e for e in sorted(VIDEO_EXTS))),
+                                         ("すべてのファイル", "*.*")])
+        files = list(self._playlist)
+        seen = {os.path.normcase(p) for p in files}
+        for path in paths:
+            path = os.path.abspath(path)
+            if os.path.isfile(path) and os.path.normcase(path) not in seen:
+                files.append(path)
+                seen.add(os.path.normcase(path))
+        self._replace_playlist(files)
+
+    def _playlist_remove_selected(self):
+        selection = self._playlist_listbox.curselection()
+        if not selection:
+            return
+        index = selection[0]
+        was_current = index == self._playlist_idx
+        files = self._playlist[:index] + self._playlist[index + 1:]
+        self._replace_playlist(files, start_index=index if was_current else None)
+        if was_current and not files:
+            self.stop()
+
+    def _playlist_move_selected(self, delta):
+        selection = self._playlist_listbox.curselection()
+        if not selection:
+            return
+        index, files = selection[0], list(self._playlist)
+        target = index + delta
+        if not 0 <= target < len(files):
+            return
+        files[index], files[target] = files[target], files[index]
+        self._replace_playlist(files)
+        self._playlist_listbox.selection_clear(0, tk.END)
+        self._playlist_listbox.selection_set(target)
+        self._playlist_listbox.see(target)
+
+    def _write_playlist_file(self, path):
+        folder = os.path.dirname(os.path.abspath(path))
+        paths = []
+        for item in self._playlist:
+            try:
+                paths.append(os.path.relpath(item, folder))
+            except ValueError:  # different Windows drive
+                paths.append(os.path.abspath(item))
+        _atomic_write_json(path, {"version": 1, "files": paths}, indent=2, ensure_ascii=False)
+
+    @staticmethod
+    def _read_playlist_file(path):
+        if os.path.getsize(path) > 4 * 1024 * 1024:
+            raise ValueError("再生リストが大きすぎます。")
+        with open(path, encoding="utf-8-sig") as source:
+            data = json.load(source)
+        if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("files"), list):
+            raise ValueError("Lumveil再生リストの形式が正しくありません。")
+        if len(data["files"]) > 10000 or any(not isinstance(p, str) for p in data["files"]):
+            raise ValueError("再生リストの項目が正しくありません。")
+        folder = os.path.dirname(os.path.abspath(path))
+        files, seen, missing = [], set(), 0
+        for item in data["files"]:
+            full = os.path.abspath(os.path.join(folder, item))
+            if not os.path.isfile(full):
+                missing += 1
+            elif os.path.normcase(full) not in seen:
+                files.append(full)
+                seen.add(os.path.normcase(full))
+        return files, missing
+
+    def _playlist_save(self):
+        path = self._ask_file(filedialog.asksaveasfilename, title="再生リストを保存",
+                              defaultextension=".lumveil.json",
+                              filetypes=[("Lumveil再生リスト", "*.lumveil.json")])
+        if path:
+            try:
+                self._write_playlist_file(path)
+            except (OSError, ValueError, TypeError) as exc:
+                self._show_error_popup(f"再生リストを保存できませんでした:\n{exc}")
+
+    def _playlist_load(self):
+        path = self._ask_file(filedialog.askopenfilename, title="再生リストを読み込む",
+                              filetypes=[("Lumveil再生リスト", "*.lumveil.json"), ("JSON", "*.json")])
+        if not path:
+            return
+        try:
+            files, missing = self._read_playlist_file(path)
+            if not files:
+                raise ValueError("再生できるファイルがありません。")
+            self._replace_playlist(files, start_index=0)
+            if missing:
+                self._show_error_popup(f"見つからない動画{missing}件を除いて読み込みました。")
+        except (OSError, ValueError, TypeError) as exc:
+            self._show_error_popup(f"再生リストを読み込めませんでした:\n{exc}")
 
     # ── ブックマーク ─────────────────────────────────────────────────────
 
@@ -1571,8 +2123,7 @@ class VideoPlayer:
 
     def _save_bookmarks(self):
         try:
-            with open(BOOKMARKS_FILE, "w", encoding="utf-8") as f:
-                json.dump(self._bookmarks, f, ensure_ascii=False, indent=2)
+            _atomic_write_json(BOOKMARKS_FILE, self._bookmarks, ensure_ascii=False, indent=2)
         except Exception as e:
             self._set_settings_error("ブックマークの保存", e)
 
@@ -1609,6 +2160,8 @@ class VideoPlayer:
             tk.Label(win, text="（ブックマークなし）", bg=BG_ADJ, fg=COL_DIM,
                      font=("Segoe UI", 9), pady=6, padx=14).pack()
 
+        content = self._make_vertical_scroll_area(win)
+
         def jump(pos_ms):
             self.player.seek(pos_ms / 1000.0, reference="absolute", precision="exact")
             win.destroy()
@@ -1621,7 +2174,7 @@ class VideoPlayer:
             self._show_bookmark_menu()
 
         for m in marks:
-            row = tk.Frame(win, bg=BG_ADJ)
+            row = tk.Frame(content, bg=BG_ADJ)
             row.pack(fill=tk.X, padx=4, pady=1)
             self._btn(row, f"{m['label']}", lambda p=m["pos_ms"]: jump(p),
                       bg=BG_ADJ, pad=(14, 4)).pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -1631,7 +2184,10 @@ class VideoPlayer:
         win.update_idletasks()
         x = self.root.winfo_pointerx() - win.winfo_reqwidth() // 2
         y = self.root.winfo_rooty() + self.root.winfo_height() - 120 - win.winfo_reqheight()
-        win.geometry(f"+{max(x,0)}+{max(y,0)}")
+        width, height = 360, min(520, win.winfo_screenheight() - 100)
+        x = min(max(x, 0), win.winfo_screenwidth() - width)
+        y = min(max(y, 0), win.winfo_screenheight() - height)
+        win.geometry(f"{width}x{height}+{x}+{y}")
         win.bind("<FocusOut>", lambda e: win.destroy())
         win.focus_force()
 
@@ -1847,7 +2403,7 @@ class VideoPlayer:
         )
         if path is None:
             if hasattr(self, "_update_status_var"):
-                self._update_status_var.set("THIRD_PARTY_NOTICES.md was not found.")
+                self._update_status_var.set("第三者ライセンス文書が見つかりません。")
             return
 
         if (hasattr(self, "_license_win") and self._license_win
@@ -1872,11 +2428,11 @@ class VideoPlayer:
                     with open(document_path, "r", encoding="utf-8", errors="replace") as handle:
                         contents[filename] = handle.read()
                 except OSError as exc:
-                    contents[filename] = f"Unable to read {filename}:\n{exc}"
+                    contents[filename] = f"{filename}を読み込めません:\n{exc}"
 
             win = tk.Toplevel(self.root)
             self._license_win = win
-            win.title("Third-party licenses")
+            win.title("第三者ライセンス")
             win.configure(bg=BG_ADJ)
             win.resizable(True, True)
             win.minsize(700, 500)
@@ -1886,11 +2442,11 @@ class VideoPlayer:
 
             head = tk.Frame(win, bg=BG_ADJ)
             head.pack(fill=tk.X, padx=18, pady=(14, 8))
-            tk.Label(head, text="Third-party licenses", bg=BG_ADJ, fg=COL_TXT,
+            tk.Label(head, text="第三者ライセンス", bg=BG_ADJ, fg=COL_TXT,
                      font=("Segoe UI", 14, "bold"), anchor="w").pack(fill=tk.X)
             tk.Label(
                 head,
-                text="Bundled notices and license texts. Select a document to read it.",
+                text="同梱ライセンスです。左の一覧から文書を選んでください。",
                 bg=BG_ADJ, fg=COL_DIM, font=("Segoe UI", 9), anchor="w",
             ).pack(fill=tk.X, pady=(3, 0))
 
@@ -1900,7 +2456,7 @@ class VideoPlayer:
             list_frame = tk.Frame(body, bg=BG_CTRL, width=220)
             list_frame.pack(side=tk.LEFT, fill=tk.Y)
             list_frame.pack_propagate(False)
-            tk.Label(list_frame, text="Documents", bg=BG_CTRL, fg=COL_TXT,
+            tk.Label(list_frame, text="文書一覧", bg=BG_CTRL, fg=COL_TXT,
                      font=("Segoe UI", 9, "bold"), anchor="w").pack(
                          fill=tk.X, padx=10, pady=(10, 6))
             document_list = tk.Listbox(
@@ -1952,7 +2508,7 @@ class VideoPlayer:
 
             foot = tk.Frame(win, bg=BG_ADJ)
             foot.pack(fill=tk.X, padx=18, pady=(0, 14))
-            self._btn(foot, "Close", close_license_window, bg=BG_ADJ,
+            self._btn(foot, "閉じる", close_license_window, bg=BG_ADJ,
                       pad=(12, 5)).pack(side=tk.RIGHT)
 
             win.protocol("WM_DELETE_WINDOW", close_license_window)
@@ -1961,7 +2517,7 @@ class VideoPlayer:
             win.focus_force()
         except Exception as exc:
             if hasattr(self, "_update_status_var"):
-                self._update_status_var.set(f"Could not open license notices: {exc}")
+                self._update_status_var.set(f"ライセンスを開けません: {exc}")
 
     @staticmethod
     def _version_tuple(value):
@@ -1989,7 +2545,7 @@ class VideoPlayer:
             return
         self._update_check_in_progress = True
         if hasattr(self, "_update_status_var"):
-            self._update_status_var.set("Checking GitHub Releases...")
+            self._update_status_var.set("GitHubの更新を確認しています…")
         thread = threading.Thread(target=self._fetch_latest_release,
                                   args=(manual,), daemon=True)
         thread.start()
@@ -2021,8 +2577,8 @@ class VideoPlayer:
                 OSError, ValueError) as exc:
             error = str(exc)
         try:
-            self.root.after(0, lambda: self._finish_update_check(info, error, manual))
-        except tk.TclError:
+            self._post_ui(self._finish_update_check, info, error, manual)
+        except Exception:
             pass
 
     def _finish_update_check(self, info, error, manual):
@@ -2031,27 +2587,27 @@ class VideoPlayer:
         self._save_player_settings()
         if error:
             if hasattr(self, "_update_status_var"):
-                prefix = "Update check failed" if manual else "Automatic update check failed"
+                prefix = "更新確認に失敗" if manual else "自動更新確認に失敗"
                 self._update_status_var.set(f"{prefix}: {error}")
             return
         if not info or self._version_tuple(info["version"]) <= self._version_tuple(APP_VERSION):
             self._update_info = None
             if hasattr(self, "_update_status_var"):
-                self._update_status_var.set(f"Lumveil v{APP_VERSION} is up to date.")
+                self._update_status_var.set(f"Lumveil v{APP_VERSION} は最新です。")
             if hasattr(self, "_update_download_button"):
                 self._update_download_button.config(state=tk.DISABLED)
             return
         self._update_info = info
         verified_asset = bool(info["asset_url"] and info["digest"].startswith("sha256:"))
         if not info["asset_name"]:
-            installer_note = "Installer asset is not available yet."
+            installer_note = "インストーラーはまだ公開されていません。"
         elif not verified_asset:
-            installer_note = "Installer SHA-256 is not available; automatic installation is disabled."
+            installer_note = "検証用SHA-256がないため、この画面からはインストールできません。"
         else:
             installer_note = info["asset_name"]
         if hasattr(self, "_update_status_var"):
             self._update_status_var.set(
-                f"New version {info['version']} is available.\n{installer_note}")
+                f"新しいバージョン {info['version']} が公開されています。\n{installer_note}")
         if hasattr(self, "_update_download_button"):
             self._update_download_button.config(
                 state=tk.NORMAL if verified_asset else tk.DISABLED)
@@ -2063,12 +2619,12 @@ class VideoPlayer:
                 webbrowser.open(info.get("release_url", GITHUB_URL + "/releases"))
             return
         if not messagebox.askyesno(
-                "Lumveil Update",
-                f"Download {info['asset_name']} and prepare installation?",
+                "Lumveilの更新",
+                f"{info['asset_name']} をダウンロードしますか？",
                 parent=self._settings_win):
             return
         self._update_download_button.config(state=tk.DISABLED)
-        self._update_status_var.set("Downloading update...")
+        self._update_status_var.set("更新をダウンロードしています…")
         threading.Thread(target=self._download_update_worker,
                          args=(dict(info),), daemon=True).start()
 
@@ -2092,33 +2648,33 @@ class VideoPlayer:
                     digest.update(chunk)
             expected = info.get("digest", "")
             if not expected.startswith("sha256:"):
-                raise ValueError("Release asset has no SHA-256 digest")
+                raise ValueError("更新ファイルのSHA-256がありません")
             if digest.hexdigest().lower() != expected[7:].lower():
-                raise ValueError("SHA-256 verification failed")
+                raise ValueError("SHA-256の検証に失敗しました")
         except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError,
                 OSError, ValueError) as exc:
             error = str(exc)
         try:
-            self.root.after(0, lambda: self._finish_update_download(path, error))
-        except tk.TclError:
+            self._post_ui(self._finish_update_download, path, error)
+        except Exception:
             pass
 
     def _finish_update_download(self, path, error):
         if error:
-            self._update_status_var.set(f"Download failed: {error}")
+            self._update_status_var.set(f"ダウンロードに失敗: {error}")
             self._update_download_button.config(state=tk.NORMAL)
             return
-        self._update_status_var.set("Download complete. Ready to install.")
+        self._update_status_var.set("ダウンロードが完了しました。")
         if not messagebox.askyesno(
-                "Lumveil Update",
-                "Close Lumveil and start the installer now?",
+                "Lumveilの更新",
+                "Lumveilを終了して、インストーラーを起動しますか？",
                 parent=self._settings_win):
             self._update_download_button.config(state=tk.NORMAL)
             return
         try:
-            subprocess.Popen([path], cwd=os.path.dirname(path))
-        except OSError as exc:
-            self._update_status_var.set(f"Could not start installer: {exc}")
+            _launch_installer_after_exit(path, (self._update_info or {}).get("digest"))
+        except (OSError, ValueError) as exc:
+            self._update_status_var.set(f"インストーラーを起動できません: {exc}")
             self._update_download_button.config(state=tk.NORMAL)
             return
         self._on_close()
@@ -2188,11 +2744,11 @@ class VideoPlayer:
     def _build_settings_tab_bar(self):
         """Replace ttk's platform-dependent tab chrome with a flat tab strip."""
         labels = [
-            (self._quick_tab, "QUICK"),
-            (self._picture_tab, "PICTURE"),
-            (self._playback_tab, "PLAYBACK"),
-            (self._advanced_tab, "ADVANCED"),
-            (self._about_tab, "ABOUT"),
+            (self._quick_tab, "かんたん"),
+            (self._picture_tab, "画質"),
+            (self._playback_tab, "再生と字幕"),
+            (self._advanced_tab, "詳細"),
+            (self._about_tab, "アプリ情報"),
         ]
         self._settings_tab_buttons = {}
         self._settings_tab_lines = {}
@@ -2217,6 +2773,9 @@ class VideoPlayer:
 
     def _sync_settings_tab_buttons(self, _event=None):
         selected = str(self._settings_tabs.select())
+        if (getattr(self, "_advanced_tab", None) is not None and
+                selected == str(self._advanced_tab)):
+            self._ensure_gpu_settings()
         for tab, button in getattr(self, "_settings_tab_buttons", {}).items():
             active = str(tab) == selected
             button.config(bg=BG_CTRL if active else BG_ADJ,
@@ -2237,7 +2796,7 @@ class VideoPlayer:
 
         settings_head = tk.Frame(self._settings_win, bg=BG_ADJ)
         settings_head.pack(fill=tk.X, padx=22, pady=(16, 8))
-        tk.Label(settings_head, text="SETTINGS", bg=BG_ADJ, fg=COL_TXT,
+        tk.Label(settings_head, text="設定", bg=BG_ADJ, fg=COL_TXT,
                  font=("Segoe UI", 12, "bold")).pack(side=tk.LEFT)
         tk.Frame(self._settings_win, bg=BG_BORDER, height=1).pack(fill=tk.X, padx=22)
         self._settings_tab_bar = tk.Frame(self._settings_win, bg=BG_ADJ)
@@ -2257,7 +2816,7 @@ class VideoPlayer:
         self._picture_tab = win
         self._settings_tabs.add(win, text="画質を調整")
         self._add_settings_tab_intro(win, "画質を調整", "映像の見た目を細かく調整したいときに使います。")
-
+        win = self._make_vertical_scroll_area(win)
         win = self._settings_card(win, pady=(4, 10))
         surface = self._settings_surface(win)
 
@@ -2307,7 +2866,7 @@ class VideoPlayer:
                        command=lambda _: setattr(self, "_dark_thresh",
                                                  round(self._thresh_var.get(), 2)))
         ts.pack(side=tk.LEFT, padx=6)
-        self._fix_scale_click(ts, self._thresh_var, 0.0, 0.9)
+        self._fix_scale_click(ts, self._thresh_var, 0.0, 1.0)
         td = tk.StringVar(value=f"{self._dark_thresh:.2f}")
         tk.Label(tr, textvariable=td, width=5,
                  bg=surface, fg=COL_YEL, font=("Consolas", 9)).pack(side=tk.LEFT)
@@ -2352,9 +2911,18 @@ class VideoPlayer:
         self._btn(br2, "設定を読み込む", self._load_adj,
                   bg=surface, pad=(10, 5)).pack(side=tk.LEFT, padx=5)
 
+        # GPU/シェーダー設定は起動直後には表示されないため、空のタブだけを
+        # 先に用意し、実際の大量のウィジェットは初回表示時に遅延構築する。
+        self._advanced_tab = tk.Frame(self._settings_tabs, bg=BG_ADJ)
+        self._settings_tabs.add(self._advanced_tab, text="詳細設定")
+        self._build_playback_settings_tab()
+        self._build_about_settings_tab()
+        self._build_settings_tab_bar()
+
     def _build_quick_settings(self, win):
         """初見の利用者が迷わず使える、日常的な設定だけを集約する。"""
         self._add_settings_tab_intro(win, "かんたん設定", "用途に合わせて選ぶだけで、よく使う設定をまとめて切り替えられます。")
+        win = self._make_vertical_scroll_area(win)
         win = self._settings_card(win)
         surface = self._settings_surface(win)
         self._settings_section_heading(
@@ -2426,7 +2994,8 @@ class VideoPlayer:
             row.pack(fill=tk.X, padx=12, pady=4)
             tk.Label(row, text=f"{label}:", width=SETTING_LABEL_W, anchor="w",
                      bg=surface, fg=COL_TXT, font=("Segoe UI", 10)).pack(side=tk.LEFT)
-            var = tk.DoubleVar(value=default)
+            initial = self._sync_preferences.get(mpv_prop, default)
+            var = tk.DoubleVar(value=initial)
 
             def _apply(_=None, var=var, prop=mpv_prop):
                 try:
@@ -2438,7 +3007,7 @@ class VideoPlayer:
                            length=200, style="Adj.Horizontal.TScale", command=_apply)
             sc.pack(side=tk.LEFT, padx=6)
             self._fix_scale_click(sc, var, lo, hi)
-            disp = tk.StringVar(value=fmt.format(default))
+            disp = tk.StringVar(value=fmt.format(initial))
             tk.Label(row, textvariable=disp, width=6,
                      bg=surface, fg=COL_BLU, font=("Consolas", 9)).pack(side=tk.LEFT)
             var.trace_add("write", lambda *_, v=var, d=disp: d.set(fmt.format(v.get())))
@@ -2449,6 +3018,7 @@ class VideoPlayer:
                 var.set(default)
                 _apply()
             self._btn(row, "↺", _reset, bg=surface, pad=(5, 3)).pack(side=tk.LEFT, padx=4)
+            _apply()
             return var
 
         self._sub_delay_var = _sync_row("字幕遅延", -5.0, 5.0, 0.0, "秒", "sub-delay")
@@ -2558,13 +3128,21 @@ class VideoPlayer:
 
         # 共通ホイール処理（_on_mousewheel）から呼び出す。後から動画側の
         # bind_allが登録されても設定タブ側の処理が上書きされないようにする。
-        self._advanced_wheel_handler = _on_wheel
+        self._scroll_wheel_handlers.append(_on_wheel)
+        def remove_handler(event):
+            if event.widget is holder and _on_wheel in self._scroll_wheel_handlers:
+                self._scroll_wheel_handlers.remove(_on_wheel)
+        holder.bind("<Destroy>", remove_handler, add="+")
         return content
 
+    def _ensure_gpu_settings(self):
+        if not self._gpu_settings_built:
+            self._build_gpu_win()
+
     def _build_gpu_win(self):
+        if self._gpu_settings_built:
+            return
         # 高度な項目は1タブに集め、必要な項目だけ開ける折りたたみ式にする。
-        self._advanced_tab = tk.Frame(self._settings_tabs, bg=BG_ADJ)
-        self._settings_tabs.add(self._advanced_tab, text="詳細設定")
         self._add_settings_tab_intro(self._advanced_tab, "詳細設定", "GPU・シェーダーなど、画質を細かく調整したいときに使います。")
         self._advanced_content = self._make_vertical_scroll_area(self._advanced_tab)
         self._smooth_tab = self._add_advanced_section(
@@ -2888,20 +3466,18 @@ class VideoPlayer:
         tk.Label(win, textvariable=self._gpu_status,
                  bg=BG_ADJ, fg=COL_GRN,
                  font=("Segoe UI", 8), pady=6).pack()
-        self._build_playback_settings_tab()
         self._build_toolbar_settings_tab()
-        self._build_about_settings_tab()
         for section in (self._smooth_tab, self._decode_tab,
                         self._shader_tab, self._output_tab):
             self._recolor_settings_tree(section, BG_CTRL)
-        self._build_settings_tab_bar()
+        self._gpu_settings_built = True
 
     def _build_playback_settings_tab(self):
         tab = tk.Frame(self._settings_tabs, bg=BG_ADJ)
         self._playback_tab = tab
         self._settings_tabs.add(tab, text="再生と字幕")
         self._add_settings_tab_intro(tab, "再生と字幕", "連続再生・再開位置・字幕と音声の同期を設定します。")
-
+        tab = self._make_vertical_scroll_area(tab)
         tab = self._settings_card(tab)
         surface = self._settings_surface(tab)
         self._settings_section_heading(tab, "再生動作")
@@ -2919,8 +3495,10 @@ class VideoPlayer:
                                 activebackground=BG_BTN_H, activeforeground=COL_TXT)
             menu.pack(side=tk.LEFT)
 
-        self._eof_var = tk.StringVar(value="次の動画を再生" if self._playback_eof_action == "next" else "停止")
-        option_row("再生終了時", self._eof_var, ("停止", "次の動画を再生"), self._on_eof_setting)
+        self._eof_var = tk.StringVar(value=next(
+            label for label, action in EOF_ACTION_OPTIONS.items()
+            if action == self._playback_eof_action))
+        option_row("再生終了時", self._eof_var, tuple(EOF_ACTION_OPTIONS), self._on_eof_setting)
 
         row = tk.Frame(tab, bg=surface)
         row.pack(fill=tk.X, padx=12, pady=5)
@@ -2934,6 +3512,14 @@ class VideoPlayer:
                                      activebackground=BG_BTN_H, activeforeground=COL_TXT)
         self._resume_btn.pack(side=tk.LEFT)
         self._style_toggle_button(self._resume_btn, self._resume_enabled)
+        row = tk.Frame(tab, bg=surface)
+        row.pack(fill=tk.X, padx=12, pady=5)
+        tk.Label(row, text="起動時に手動画質を復元:", width=SETTING_LABEL_W, anchor="w",
+                 bg=surface, fg=COL_TXT, font=("Segoe UI", 10)).pack(side=tk.LEFT)
+        self._restore_adj_btn = self._btn(row, "ON" if self._restore_manual_settings else "OFF",
+                                         self._toggle_restore_manual_settings, bg=surface)
+        self._restore_adj_btn.pack(side=tk.LEFT)
+        self._style_toggle_button(self._restore_adj_btn, self._restore_manual_settings)
 
         self._end_var = tk.StringVar(value="先頭へ戻る" if self._folder_end_action == "loop" else "停止")
         option_row("フォルダ末尾", self._end_var, ("停止", "先頭へ戻る"), self._on_folder_end_setting)
@@ -2948,34 +3534,34 @@ class VideoPlayer:
     def _build_about_settings_tab(self):
         tab = tk.Frame(self._settings_tabs, bg=BG_ADJ)
         self._about_tab = tab
-        self._settings_tabs.add(tab, text="About")
+        self._settings_tabs.add(tab, text="アプリ情報")
         self._add_settings_tab_intro(
-            tab, "About Lumveil", "Application information, updates, and licenses.")
-
+            tab, "Lumveilについて", "バージョン・更新・ライセンスを確認できます。")
+        tab = self._make_vertical_scroll_area(tab)
         card = self._settings_card(tab)
         surface = self._settings_surface(card)
         app_row = tk.Frame(card, bg=surface)
         app_row.pack(fill=tk.X, padx=16, pady=(14, 10))
         tk.Label(app_row, text="LUMVEIL", bg=surface, fg=COL_BLU,
                  font=("Segoe UI", 20, "bold")).pack(anchor="w")
-        tk.Label(app_row, text=f"Version {APP_VERSION}", bg=surface, fg=COL_DIM,
+        tk.Label(app_row, text=f"バージョン {APP_VERSION}", bg=surface, fg=COL_DIM,
                  font=("Segoe UI", 10)).pack(anchor="w", pady=(2, 0))
-        tk.Label(app_row, text="Created by ふぁん", bg=surface, fg=COL_TXT,
+        tk.Label(app_row, text="制作: ふぁん", bg=surface, fg=COL_TXT,
                  font=("Segoe UI", 10)).pack(anchor="w", pady=(8, 0))
         links = tk.Frame(card, bg=surface)
         links.pack(fill=tk.X, padx=16, pady=(0, 14))
-        self._btn(links, "Open GitHub", lambda: webbrowser.open(GITHUB_URL),
+        self._btn(links, "GitHubを開く", lambda: webbrowser.open(GITHUB_URL),
                   bg=surface, pad=(12, 5)).pack(side=tk.LEFT)
-        self._btn(links, "Third-party licenses", self._open_license_notices,
+        self._btn(links, "第三者ライセンス", self._open_license_notices,
                   bg=surface, pad=(12, 5)).pack(side=tk.LEFT, padx=(8, 0))
 
         update = self._settings_card(tab)
         update_surface = self._settings_surface(update)
         self._settings_section_heading(
-            update, "Updates", "Check GitHub Releases without interrupting playback.")
+            update, "更新", "再生を続けながらGitHubの更新を確認できます。")
         toggle_row = tk.Frame(update, bg=update_surface)
         toggle_row.pack(fill=tk.X, padx=12, pady=(0, 8))
-        tk.Label(toggle_row, text="Automatic update checks:", bg=update_surface,
+        tk.Label(toggle_row, text="自動で更新を確認:", bg=update_surface,
                  fg=COL_TXT, font=("Segoe UI", 10)).pack(side=tk.LEFT)
         self._auto_update_button = self._btn(
             toggle_row, "ON" if self._auto_update_checks else "OFF",
@@ -2985,21 +3571,36 @@ class VideoPlayer:
 
         actions = tk.Frame(update, bg=update_surface)
         actions.pack(fill=tk.X, padx=12, pady=(0, 8))
-        self._btn(actions, "Check now", lambda: self._check_for_updates(manual=True),
+        self._btn(actions, "更新を確認", lambda: self._check_for_updates(manual=True),
                   bg=update_surface, pad=(12, 5)).pack(side=tk.LEFT)
         self._update_download_button = self._btn(
-            actions, "Download and install", self._download_update,
+            actions, "ダウンロードしてインストール", self._download_update,
             bg=BG_SELECTED, fg=COL_BLU, pad=(12, 5))
         self._update_download_button.pack(side=tk.LEFT, padx=(8, 0))
         self._update_download_button.config(state=tk.DISABLED)
-        self._update_status_var = tk.StringVar(value="Not checked yet.")
+        self._update_status_var = tk.StringVar(value="まだ確認していません。")
         tk.Label(update, textvariable=self._update_status_var, bg=update_surface,
                  fg=COL_DIM, justify=tk.LEFT, anchor="w", wraplength=590,
                  font=("Segoe UI", 9)).pack(fill=tk.X, padx=12, pady=(0, 14))
 
     def _on_eof_setting(self, value):
-        self._playback_eof_action = "next" if value == "次の動画を再生" else "stop"
+        self._playback_eof_action = EOF_ACTION_OPTIONS.get(value, "next")
+        self._apply_playback_eof_action()
+        if self._playback_eof_action == "repeat" and self._current_path:
+            try:
+                if self.player.eof_reached:
+                    self.player.seek(0, reference="absolute", precision="exact")
+                    self.player.pause = False
+            except Exception as e:
+                self._set_settings_error("リピートの開始", e)
         self._save_player_settings()
+
+    def _apply_playback_eof_action(self):
+        """Let mpv loop in place, preserving AUTO, resume and playlist state."""
+        try:
+            self.player["loop-file"] = "inf" if self._playback_eof_action == "repeat" else "no"
+        except Exception as e:
+            self._set_settings_error("再生終了時の設定", e)
 
     def _toggle_resume_enabled(self):
         self._resume_enabled = not self._resume_enabled
@@ -3013,9 +3614,15 @@ class VideoPlayer:
         self._folder_end_action = "loop" if value == "先頭へ戻る" else "stop"
         self._save_player_settings()
 
+    def _toggle_restore_manual_settings(self):
+        self._restore_manual_settings = not self._restore_manual_settings
+        self._restore_adj_btn.config(text="ON" if self._restore_manual_settings else "OFF")
+        self._style_toggle_button(self._restore_adj_btn, self._restore_manual_settings)
+        self._save_player_settings()
+
     def _on_playlist_sort_setting(self, value):
         self._playlist_sort = "modified" if value == "更新日時順" else "name"
-        if self._current_path:
+        if self._current_path and getattr(self, "_playlist_source", "folder") == "folder":
             self._build_folder_playlist(self._current_path)
         self._save_player_settings()
 
@@ -3093,6 +3700,7 @@ class VideoPlayer:
 
     def _toggle_gpu_win(self):
         self._close_quality_quick_panel()
+        self._ensure_gpu_settings()
         self._settings_tabs.select(self._advanced_tab)
         if not self._settings_win.winfo_viewable():
             x = self.root.winfo_rootx() + 20
@@ -3139,24 +3747,27 @@ class VideoPlayer:
             self._apply_gpu_settings()
             self._apply_vf_chain()
 
-            # 設定UIを現在値へ同期する。
-            self._gpu_scale_var.set(next(label for value, label in self._SCALE_OPTIONS
-                                         if value == self._gpu_scale))
-            self._gpu_cscale_var.set(next(label for value, label in self._CSCALE_OPTIONS
-                                          if value == self._gpu_cscale))
-            self._deband_btn.config(text="ON" if self._gpu_deband else "OFF",
-                                    fg=COL_GRN if self._gpu_deband else COL_TXT)
-            self._interpolate_btn.config(text="ON" if self._gpu_interpolate else "OFF",
-                                         fg=COL_GRN if self._gpu_interpolate else COL_TXT)
-            self._amf_frc_btn.config(text="OFF", fg=COL_TXT)
-            self._style_toggle_button(self._deband_btn, self._gpu_deband)
-            self._style_toggle_button(self._interpolate_btn, self._gpu_interpolate)
-            self._style_toggle_button(self._amf_frc_btn, False)
+            # 詳細設定UIがまだ構築されていない場合も、内部設定と再生中の
+            # mpvだけを更新する。詳細設定を初めて開いた時に現在値で生成される。
+            if self._gpu_settings_built:
+                self._gpu_scale_var.set(next(label for value, label in self._SCALE_OPTIONS
+                                             if value == self._gpu_scale))
+                self._gpu_cscale_var.set(next(label for value, label in self._CSCALE_OPTIONS
+                                              if value == self._gpu_cscale))
+                self._deband_btn.config(text="ON" if self._gpu_deband else "OFF",
+                                        fg=COL_GRN if self._gpu_deband else COL_TXT)
+                self._interpolate_btn.config(text="ON" if self._gpu_interpolate else "OFF",
+                                             fg=COL_GRN if self._gpu_interpolate else COL_TXT)
+                self._amf_frc_btn.config(text="OFF", fg=COL_TXT)
+                self._style_toggle_button(self._deband_btn, self._gpu_deband)
+                self._style_toggle_button(self._interpolate_btn, self._gpu_interpolate)
+                self._style_toggle_button(self._amf_frc_btn, False)
             self._quality_preset = name
             self._sync_quality_preset_buttons()
             self._save_gpu_settings()
             suffix = "（AUTOは動画を開いてから開始できます）" if name == "暗所優先" else ""
-            self._gpu_status.set(f"✓ 用途別プリセット: {name}{suffix}")
+            if hasattr(self, "_gpu_status"):
+                self._gpu_status.set(f"✓ 用途別プリセット: {name}{suffix}")
         finally:
             self._applying_quality_preset = False
 
@@ -3204,7 +3815,7 @@ class VideoPlayer:
             self.player["scale-antiring"] = val
         except Exception:
             pass
-        self._save_gpu_settings()
+        self._schedule_gpu_settings_save()
 
     def _on_gpu_sigmoid(self):
         self._gpu_sigmoid = not self._gpu_sigmoid
@@ -3300,14 +3911,15 @@ class VideoPlayer:
                           if not os.path.basename(p).startswith("Anime4K_")]
         for fname in files:
             self._gpu_glsl.append(os.path.join(_SHADER_DIR, fname))
-        self._glsl_listbox.delete(0, tk.END)
-        for p in self._gpu_glsl:
-            self._glsl_listbox.insert(tk.END, os.path.basename(p))
+        if hasattr(self, "_glsl_listbox"):
+            self._glsl_listbox.delete(0, tk.END)
+            for p in self._gpu_glsl:
+                self._glsl_listbox.insert(tk.END, os.path.basename(p))
         self._apply_glsl_shaders()
         if save:
             self._mark_quality_custom()
             self._save_gpu_settings()
-        if show_status:
+        if show_status and hasattr(self, "_gpu_status"):
             self._gpu_status.set(f"✓ Anime4Kプリセット適用: {name}")
         for mname, btn in self._a4k_btns.items():
             self._set_button_selected(btn, mname == name, "accent")
@@ -3350,12 +3962,18 @@ class VideoPlayer:
 
     def _apply_glsl_shaders(self):
         try:
+            paths = self._gpu_glsl + [_RT_CONTRAST_SHADER_PATH, _RT_SHADOW_SHADER_PATH]
+            for path in paths:
+                if not os.path.isfile(path):
+                    raise FileNotFoundError(path)
             self.player.command("change-list", "glsl-shaders", "clr", "")
             for p in self._gpu_glsl:
                 self.player.command("change-list", "glsl-shaders", "append", p)
             # 追加コントラスト・シャドウリフトは手動でも使えるため、常時読込する（強度0なら無処理）。
             self.player.command("change-list", "glsl-shaders", "append", _RT_CONTRAST_SHADER_PATH)
             self.player.command("change-list", "glsl-shaders", "append", _RT_SHADOW_SHADER_PATH)
+            self._rt_analysis_revision += 1
+            self._last_shader_opts = None
             if "contrast" in self._adj_vars:
                 self._apply_effective_contrast(self._adj_vars["contrast"][0].get())
             self._apply_shadow_lift(self._shader_opts.get("shadow_lift", 0.0))
@@ -3366,11 +3984,14 @@ class VideoPlayer:
         """glsl-shader-optsは一括上書きのため、複数パラメータを一元管理してまとめて適用する。"""
         try:
             opts = ",".join(f"{k}={v:.3f}" for k, v in self._shader_opts.items())
+            if opts == self._last_shader_opts:
+                return
             self.player.command("set", "glsl-shader-opts", opts)
+            self._last_shader_opts = opts
         except Exception as e:
             self._set_settings_error("シェーダー設定の反映", e)
 
-    def _apply_effective_contrast(self, value):
+    def _apply_effective_contrast(self, value, *, flush=True):
         """-100〜+300の実効値を、MPV(+100まで)と拡張シェーダーへ連続して配分する。"""
         value = max(-100.0, min(300.0, float(value)))
         mpv_value = min(100.0, value)
@@ -3378,15 +3999,18 @@ class VideoPlayer:
         try:
             self.player["contrast"] = int(round(mpv_value))
         except Exception:
-            pass
+            return False
         self._shader_opts["auto_contrast"] = strength
-        self._apply_shader_opts()
+        if flush:
+            self._apply_shader_opts()
+        return True
 
-    def _apply_shadow_lift(self, value):
+    def _apply_shadow_lift(self, value, *, flush=True):
         """0.0〜1.0にクランプしてシャドウリフトシェーダーへ適用する。"""
         value = max(0.0, min(1.0, float(value)))
         self._shader_opts["shadow_lift"] = value
-        self._apply_shader_opts()
+        if flush:
+            self._apply_shader_opts()
 
     def _on_manual_shadow_lift(self):
         """画質タブのシャドウリフトスライダー操作時に呼ばれる。AUTO稼働中は無視する
@@ -3520,10 +4144,24 @@ class VideoPlayer:
             "quality_preset": self._quality_preset,
         }
         try:
-            with open(GPU_SETTINGS, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            _atomic_write_json(GPU_SETTINGS, data, indent=2, ensure_ascii=False)
         except Exception as e:
             self._set_settings_error("GPU設定の保存", e)
+
+    def _schedule_gpu_settings_save(self):
+        """スライダー連続操作中の小さなJSON書き込みをまとめる。"""
+        if self._gpu_save_after_id is not None:
+            try:
+                self.root.after_cancel(self._gpu_save_after_id)
+            except tk.TclError:
+                pass
+        self._gpu_save_after_id = self.root.after(250, self._flush_gpu_settings_save)
+
+    def _flush_gpu_settings_save(self):
+        pending = self._gpu_save_after_id is not None
+        self._gpu_save_after_id = None
+        if pending:
+            self._save_gpu_settings()
 
     def _load_gpu_settings(self):
         if not os.path.exists(GPU_SETTINGS):
@@ -3531,20 +4169,25 @@ class VideoPlayer:
         try:
             with open(GPU_SETTINGS, encoding="utf-8") as f:
                 data = json.load(f)
-            self._gpu_scale       = data.get("scale",       self._gpu_scale)
-            self._gpu_cscale      = data.get("cscale",      self._gpu_cscale)
-            self._gpu_deband      = data.get("deband",      self._gpu_deband)
-            self._gpu_antiring    = data.get("antiring",    self._gpu_antiring)
-            self._gpu_sigmoid     = data.get("sigmoid",     self._gpu_sigmoid)
-            self._gpu_correct_ds  = data.get("correct_ds",  self._gpu_correct_ds)
-            self._gpu_interpolate = data.get("interpolate", self._gpu_interpolate)
-            self._gpu_hwdec       = data.get("hwdec",       self._gpu_hwdec)
-            self._gpu_dither      = data.get("dither",      self._gpu_dither)
-            self._gpu_tonemapping = data.get("tonemapping", self._gpu_tonemapping)
-            self._gpu_deinterlace = data.get("deinterlace", self._gpu_deinterlace)
-            self._gpu_amf_frc     = data.get("amf_frc",     self._gpu_amf_frc)
-            self._gpu_glsl        = [p for p in data.get("glsl", [])
-                                     if os.path.exists(p)]
+            if not isinstance(data, dict):
+                return
+            for key, attr, choices in (
+                ("scale", "_gpu_scale", self._SCALE_OPTIONS),
+                ("cscale", "_gpu_cscale", self._CSCALE_OPTIONS),
+                ("hwdec", "_gpu_hwdec", self._HWDEC_OPTIONS),
+                ("dither", "_gpu_dither", self._DITHER_OPTIONS),
+                ("tonemapping", "_gpu_tonemapping", self._TONEMAP_OPTIONS),
+            ):
+                if data.get(key) in [value for value, _ in choices]:
+                    setattr(self, attr, data[key])
+            for key in ("deband", "sigmoid", "correct_ds", "interpolate", "deinterlace", "amf_frc"):
+                if isinstance(data.get(key), bool):
+                    setattr(self, "_gpu_" + key, data[key])
+            self._gpu_antiring = _bounded_number(data.get("antiring"), 0, 0, 1)
+            paths = data.get("glsl", [])
+            self._gpu_glsl = [p for p in paths if isinstance(p, str) and os.path.isfile(p)] if isinstance(paths, list) else []
+            if self._gpu_amf_frc:
+                self._gpu_interpolate = False
             saved_preset = data.get("quality_preset", "カスタム")
             self._quality_preset = saved_preset if saved_preset in QUALITY_PRESETS else "カスタム"
         except Exception:
@@ -3562,10 +4205,7 @@ class VideoPlayer:
             self.player["dither"]              = self._gpu_dither
             self.player["tone-mapping"]        = self._gpu_tonemapping
             self.player["deinterlace"]         = self._gpu_deinterlace
-            if self._gpu_interpolate:
-                self.player["video-sync"]    = "display-resample"
-                self.player["interpolation"] = True
-                self.player["tscale"]        = "oversample"
+            self._set_interpolate_mpv(self._gpu_interpolate)
         except Exception as e:
             self._set_settings_error("GPU設定の適用", e)
         self._apply_glsl_shaders()
@@ -3577,7 +4217,9 @@ class VideoPlayer:
     def _fix_scale_click(scale, var, lo, hi):
         def _jump(e):
             ratio = max(0.0, min(1.0, e.x / max(scale.winfo_width(), 1)))
-            scale.after(1, lambda: var.set(lo + ratio * (hi - lo)))
+            # ttk.Scale.set also runs its command; Variable.set only changes
+            # the label and leaves the native player at the previous value.
+            scale.after(1, lambda: scale.set(lo + ratio * (hi - lo)))
         scale.bind("<Button-1>", _jump, add=True)
 
     # ── 速度 ──────────────────────────────────────────────────────────────
@@ -3832,6 +4474,8 @@ class VideoPlayer:
     # ── 画像調整 ──────────────────────────────────────────────────────────
 
     def _on_adjust(self, key):
+        self._rt_analysis_revision += 1
+        self._rt_applied_values.pop(key, None)
         val = int(round(self._adj_vars[key][0].get()))
         if key == "contrast":
             self._apply_effective_contrast(val)
@@ -3887,27 +4531,35 @@ class VideoPlayer:
         if getattr(self, "_rt_mode_btns", None):
             self._sync_rt_mode_buttons()
 
-    def _save_adj(self):
+    def _save_adj(self, quiet=False):
         data = {k: int(round(v.get())) for k, (v, _) in self._adj_vars.items()}
+        if self._rt_enabled:
+            data.update({k: int(round(v)) for k, v in self._rt_base_adj.items()})
         data["rt_mode"] = self._rt_mode
         data["shadow_lift"] = int(round(self._manual_shadow_lift.get()))
+        data["dark_thresh"] = self._dark_thresh
         try:
-            with open(ADJ_SETTINGS, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-            self._auto_adj_status.set("💾 設定を保存しました")
+            _atomic_write_json(ADJ_SETTINGS, data, indent=2, ensure_ascii=False)
+            if not quiet:
+                self._settings_status.set("手動画質を保存しました。")
         except Exception as e:
-            self._auto_adj_status.set(f"⚠ 保存失敗: {e}")
+            self._set_settings_error("手動画質の保存", e)
 
-    def _load_adj(self):
+    def _load_adj(self, quiet=False):
         if not os.path.exists(ADJ_SETTINGS):
-            self._auto_adj_status.set("⚠ 保存された設定がありません")
+            if not quiet:
+                self._settings_status.set("保存された手動画質がありません。")
             return
         try:
             with open(ADJ_SETTINGS, encoding="utf-8") as f:
                 data = json.load(f)
-            for k, v in data.items():
-                if k in self._adj_vars:
-                    self._adj_vars[k][0].set(int(float(v)))
+            if not isinstance(data, dict):
+                raise ValueError("設定ファイルの形式が正しくありません。")
+            if self._rt_enabled:
+                self._toggle_rt_adj()
+            for k, _label, lo, hi, default in ADJ_PARAMS:
+                if k in data:
+                    self._adj_vars[k][0].set(round(_bounded_number(data[k], default, lo, hi)))
                     self._on_adjust(k)
             rt_mode = data.get("rt_mode")
             if rt_mode in RT_MODES:
@@ -3916,18 +4568,21 @@ class VideoPlayer:
                 self._rt_mode = "標準"
             self._sync_rt_mode_buttons()
             if "shadow_lift" in data:
-                self._manual_shadow_lift.set(int(float(data["shadow_lift"])))
+                self._manual_shadow_lift.set(round(_bounded_number(data["shadow_lift"], 0, 0, 100)))
                 if not self._rt_enabled:
                     self._on_manual_shadow_lift()
             # 旧形式の「追加コントラスト」は実効コントラストへ移行する。
             if "extra_contrast" in data:
-                base = float(data.get("contrast", 0))
-                self._adj_vars["contrast"][0].set(min(300.0,
-                    base + float(data["extra_contrast"])))
+                base = _bounded_number(data.get("contrast"), 0, -100, 100)
+                extra = _bounded_number(data["extra_contrast"], 0, 0, 200)
+                self._adj_vars["contrast"][0].set(min(300.0, base + extra))
                 self._on_adjust("contrast")
-            self._auto_adj_status.set("📂 設定を読み込みました")
+            self._dark_thresh = _bounded_number(data.get("dark_thresh"), 1, 0, 1)
+            self._thresh_var.set(self._dark_thresh)
+            if not quiet:
+                self._settings_status.set("手動画質を読み込みました。")
         except Exception as e:
-            self._auto_adj_status.set(f"⚠ 読み込み失敗: {e}")
+            self._set_settings_error("手動画質の読込", e)
 
     # ── ノイズ軽減 ────────────────────────────────────────────────────────
 
@@ -3963,7 +4618,7 @@ class VideoPlayer:
                 self.player.command("vf", "set", target)
             except Exception:
                 pass
-        self.root.after(50, _set_target)
+        self._after_current_file(50, _set_target)
 
     def _toggle_denoise(self):
         self._denoise = not self._denoise
@@ -4014,23 +4669,64 @@ class VideoPlayer:
         if path:
             self._open_path(path)
 
+    def _open_external_paths(self, paths):
+        """Open paths from startup or a second-instance handoff."""
+        files = []
+        seen = set()
+        for path in paths or []:
+            if not isinstance(path, str):
+                continue
+            try:
+                path = os.path.abspath(path)
+                key = os.path.normcase(path)
+                if key not in seen and os.path.isfile(path):
+                    files.append(path)
+                    seen.add(key)
+            except (OSError, TypeError):
+                continue
+        if len(files) > 1:
+            self._play_list(files, 0)
+        elif files:
+            self._open_path(files[0])
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
+        except tk.TclError:
+            pass
+
     def _open_path(self, path, _from_playlist=False):
+        path = os.path.abspath(path)
+        if not os.path.isfile(path):
+            self._show_error_popup(f"ファイルが見つかりません:\n{path}")
+            return
+        self._hide_preview()
         self._update_resume_position()  # 切り替え前のファイルの位置を保存
         path = os.path.abspath(path)
-        self._current_path = path
+        with self._mpv_event_lock:
+            self._media_generation += 1
+            self._current_path = path
+            self._mpv_pending_eof = None
+        self._cached_duration_ms = 0.0
+        self._cached_time_ms = 0.0
+        self._rt_baseline = None
+        self._rt_targets = dict(self._rt_base_adj, shadow_lift=0.0)
+        self._rt_applied_values.clear()
+        self._manual_status_stats = None
         self._thumb_cache.clear()
         try:
             self.player.play(path)
             self.player["ab-loop-a"] = "no"
             self.player["ab-loop-b"] = "no"
-        except Exception:
-            pass
+        except Exception as exc:
+            self._report_playback_error(self._media_generation, path, str(exc))
+            return
         self._ab_state = 0
         self._ab_btn.config(text="A-B")
         self._set_button_selected(self._ab_btn, False)
         self.root.title(f"Lumveil — {os.path.basename(path)}")
         self._show_main_controls(schedule=True)
-        self.root.after(600, self._fetch_fps)
+        self._after_current_file(600, self._fetch_fps)
         self._add_recent_file(path)
         if not _from_playlist:
             self._build_folder_playlist(path)
@@ -4040,24 +4736,69 @@ class VideoPlayer:
 
     def _build_folder_playlist(self, path):
         """単体でファイルを開いた際、同じフォルダ内の動画を連続再生の対象にする。"""
+        self._playlist_scan_token += 1
+        self._playlist_source = "folder"
+        scan_token = self._playlist_scan_token
+        sort_mode = self._playlist_sort
+        self._playlist, self._playlist_idx = [path], 0
         folder = os.path.dirname(path)
+        threading.Thread(
+            target=self._scan_folder_playlist,
+            args=(scan_token, path, folder, sort_mode),
+            name="LumveilPlaylistScan",
+            daemon=True,
+        ).start()
+
+    def _scan_folder_playlist(self, scan_token, path, folder, sort_mode):
+        """Scan a folder away from Tk so opening a video is immediately responsive."""
+        files = []
         try:
-            entries = sorted(os.listdir(folder))
-        except Exception:
-            self._playlist, self._playlist_idx = [path], 0
+            with os.scandir(folder) as entries:
+                for entry in entries:
+                    try:
+                        if (not entry.is_file() or
+                                os.path.splitext(entry.name)[1].lower() not in VIDEO_EXTS):
+                            continue
+                        entry_path = os.path.abspath(entry.path)
+                        if sort_mode == "modified":
+                            files.append((entry.stat().st_mtime_ns,
+                                          entry.name.casefold(), entry_path))
+                        else:
+                            files.append((entry.name.casefold(), entry_path))
+                    except OSError:
+                        continue
+            if sort_mode == "modified":
+                files.sort(key=lambda item: (item[0], item[1]))
+                files = [item[2] for item in files]
+            else:
+                files.sort(key=lambda item: item[0])
+                files = [item[1] for item in files]
+        except OSError:
+            files = []
+
+        target = os.path.normcase(os.path.abspath(path))
+        current_index = next(
+            (idx for idx, candidate in enumerate(files)
+             if os.path.normcase(os.path.abspath(candidate)) == target),
+            -1,
+        )
+        if current_index < 0:
+            files.append(path)
+            current_index = len(files) - 1
+        self._post_ui(self._finish_folder_playlist,
+                      scan_token, path, files, current_index)
+
+    def _finish_folder_playlist(self, scan_token, path, files, current_index):
+        if (scan_token != self._playlist_scan_token or
+                path != self._current_path):
             return
-        files = [os.path.join(folder, f) for f in entries
-                 if os.path.splitext(f)[1].lower() in VIDEO_EXTS]
-        if self._playlist_sort == "modified":
-            files.sort(key=lambda p: os.path.getmtime(p))
-        else:
-            files.sort(key=lambda p: os.path.basename(p).lower())
-        if path not in files:
-            files = [path]
-        self._playlist     = files
-        self._playlist_idx = files.index(path)
+        self._playlist = files
+        self._playlist_idx = current_index
+        self._refresh_playlist_popup()
 
     def _play_list(self, files, start_idx):
+        self._playlist_scan_token += 1
+        self._playlist_source = "manual"
         self._playlist     = files
         self._playlist_idx = start_idx
         self._open_path(files[start_idx], _from_playlist=True)
@@ -4133,11 +4874,12 @@ class VideoPlayer:
             # 高フレームレート素材かどうかがこの時点で初めて確定するため、
             # AMF FRCのバイパス判定を動画ごとに再適用する。
             self._apply_vf_chain()
-            if self.fps > AMF_FRC_MAX_FPS:
-                self._gpu_status.set(
-                    "⚠ AMD AMFフレーム補間: ON（高フレームレート素材のため自動スキップ中）")
-            else:
-                self._gpu_status.set("✓ AMD AMFフレーム補間: ON")
+            if hasattr(self, "_gpu_status"):
+                if self.fps > AMF_FRC_MAX_FPS:
+                    self._gpu_status.set(
+                        "⚠ AMD AMFフレーム補間: ON（高フレームレート素材のため自動スキップ中）")
+                else:
+                    self._gpu_status.set("✓ AMD AMFフレーム補間: ON")
 
     # ── 再生制御 ──────────────────────────────────────────────────────────
 
@@ -4177,6 +4919,153 @@ class VideoPlayer:
             self.player.frame_back_step()
         except Exception:
             pass
+
+    def _tool_window(self, title, geometry="460x300"):
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.configure(bg=BG_ADJ)
+        win.transient(self.root)
+        x, y = self.root.winfo_rootx() + 30, self.root.winfo_rooty() + 40
+        win.geometry(f"{geometry}+{max(0, x)}+{max(0, y)}")
+        _apply_dark_titlebar(win)
+        win.bind("<Escape>", lambda _e: win.destroy())
+        return win
+
+    def _seek_to_time(self, value):
+        seconds = _parse_seek_time(value)
+        duration = self._get_duration_ms() / 1000
+        if not self._current_path or duration <= 0:
+            raise ValueError("シークできる動画を開いてください。")
+        if seconds > duration:
+            raise ValueError(f"動画の長さ {self._fmt(int(duration * 1000))} 以内で指定してください。")
+        self.player.seek(seconds, reference="absolute", precision="exact")
+
+    def _show_time_jump(self):
+        win = self._tool_window("指定時刻へ移動", "400x170")
+        tk.Label(win, text="秒 / 分:秒 / 時:分:秒（例: 1:23:45）", bg=BG_ADJ,
+                 fg=COL_TXT, font=("Segoe UI", 10)).pack(pady=(14, 6))
+        entry = tk.Entry(win, bg=BG_CTRL, fg=COL_TXT, insertbackground=COL_TXT,
+                         font=("Consolas", 12))
+        entry.pack(padx=20, fill=tk.X)
+        entry.insert(0, self._fmt(int(self._get_time_ms())))
+        error = tk.StringVar()
+        tk.Label(win, textvariable=error, bg=BG_ADJ, fg=COL_RED,
+                 wraplength=360, font=("Segoe UI", 9)).pack(pady=4)
+        def jump(_event=None):
+            try:
+                self._seek_to_time(entry.get())
+                win.destroy()
+            except Exception as exc:
+                error.set(str(exc))
+        self._btn(win, "移動", jump, bg=BG_SELECTED, fg=COL_BLU).pack()
+        entry.bind("<Return>", jump)
+        entry.select_range(0, tk.END)
+        entry.focus_force()
+
+    def _chapter_list(self):
+        try:
+            return [chapter for chapter in (self.player.chapter_list or [])
+                    if isinstance(chapter, dict) and isinstance(chapter.get("time"), (int, float))
+                    and math.isfinite(chapter["time"]) and chapter["time"] >= 0]
+        except Exception:
+            return []
+
+    def _show_chapters(self):
+        chapters = self._chapter_list()
+        win = self._tool_window("チャプター")
+        if not chapters:
+            tk.Label(win, text="この動画にはチャプターがありません。", bg=BG_ADJ,
+                     fg=COL_DIM, font=("Segoe UI", 10)).pack(pady=25)
+            return
+        body = tk.Frame(win, bg=BG_ADJ)
+        body.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+        scroll = tk.Scrollbar(body)
+        listing = tk.Listbox(body, bg=BG_CTRL, fg=COL_TXT, selectbackground=BG_SELECTED,
+                             relief=tk.FLAT, font=("Segoe UI", 10), yscrollcommand=scroll.set)
+        listing.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.configure(command=listing.yview)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        for i, chapter in enumerate(chapters):
+            listing.insert(tk.END, f"{self._fmt(int(chapter['time'] * 1000))}  {chapter.get('title') or f'チャプター {i + 1}'}")
+        def pick(_event=None):
+            selection = listing.curselection()
+            if selection:
+                try:
+                    self._seek_to_time(str(chapters[selection[0]]["time"]))
+                    win.destroy()
+                except Exception as exc:
+                    self._show_error_popup(str(exc))
+        listing.bind("<Double-Button-1>", pick)
+        listing.bind("<Return>", pick)
+        self._btn(win, "選択したチャプターへ", pick, bg=BG_ADJ).pack(pady=(0, 10))
+
+    def _play_relative_chapter(self, delta):
+        chapters = self._chapter_list()
+        if not chapters:
+            return
+        position = self._get_time_ms() / 1000
+        if delta > 0:
+            target = next((c["time"] for c in chapters if c["time"] > position + .1), None)
+        else:
+            target = next((c["time"] for c in reversed(chapters) if c["time"] < position - 1), None)
+        if target is not None:
+            try:
+                self._seek_to_time(str(target))
+            except Exception as exc:
+                self._show_error_popup(str(exc))
+
+    def _playback_info_text(self):
+        def prop(name):
+            try:
+                return getattr(self.player, name.replace("-", "_"))
+            except Exception:
+                return None
+        if not self._current_path:
+            return "動画を開くと、実際の再生状態を表示します。"
+        hwdec = prop("hwdec-current")
+        decoding = "再生準備中" if not prop("video-params") else (
+            f"GPU: {hwdec}" if hwdec and hwdec != "no" else "CPU（ソフトウェアデコード）")
+        params = prop("video-params") or {}
+        return (f"ファイル: {os.path.basename(self._current_path)}\n\n"
+                f"映像デコード（実際）: {decoding}\n"
+                f"GPU支援（設定）: {self._gpu_hwdec}\n"
+                f"映像: {params.get('w', '--')} × {params.get('h', '--')}\n"
+                f"元のフレームレート: {prop('container-fps') or '--'} fps\n"
+                f"ドロップフレーム: {prop('frame-drop-count') or 0}\n"
+                f"音声コーデック: {prop('audio-codec-name') or 'なし'}\n"
+                f"描画出力: {prop('current-vo') or '--'}")
+
+    def _show_playback_info(self):
+        win = self._tool_window("再生情報 / GPU使用状態", "520x300")
+        status = tk.StringVar()
+        tk.Label(win, textvariable=status, bg=BG_ADJ, fg=COL_TXT,
+                 justify=tk.LEFT, anchor="nw", wraplength=490,
+                 font=("Segoe UI", 10)).pack(fill=tk.BOTH, expand=True, padx=14, pady=12)
+        def refresh():
+            if self._closing or not win.winfo_exists():
+                return
+            status.set(self._playback_info_text())
+            self.root.after(1000, refresh)
+        refresh()
+
+    def _show_shortcuts(self):
+        win = self._tool_window("ショートカット一覧", "500x440")
+        content = self._make_vertical_scroll_area(win)
+        for keys, label in (
+            ("Ctrl+O", "動画を開く"), ("Space", "再生 / 一時停止"),
+            ("← / →", "5秒戻る / 進む"), ("Ctrl+← / →", "前 / 次の動画"),
+            (", / .", "コマ戻し / コマ送り"), ("↑ / ↓", "音量を上げる / 下げる"),
+            ("M", "ミュート"), ("F11", "全画面切替"), ("Esc", "全画面解除 / 補助画面を閉じる"),
+            ("J", "指定時刻へ移動"), ("PageUp / PageDown", "前 / 次のチャプター"),
+            ("T", "常に手前に表示"), ("I", "再生情報 / GPU使用状態"),
+            ("F1", "この一覧を表示"),
+        ):
+            row = tk.Frame(content, bg=BG_ADJ)
+            row.pack(fill=tk.X, padx=14, pady=5)
+            tk.Label(row, text=keys, width=22, anchor="w", bg=BG_ADJ,
+                     fg=COL_BLU, font=("Consolas", 10)).pack(side=tk.LEFT)
+            tk.Label(row, text=label, bg=BG_ADJ, fg=COL_TXT,
+                     font=("Segoe UI", 10)).pack(side=tk.LEFT)
 
     # ── シークバー ────────────────────────────────────────────────────────
 
@@ -4281,24 +5170,56 @@ class VideoPlayer:
 
         if self._preview_pending_key == key:
             return
-        self._prev_cancel.set()
-        cancel = threading.Event()
-        self._prev_cancel = cancel
         self._preview_pending_key = key
-        threading.Thread(target=self._gen_preview_bg,
-                         args=(self._current_path, pos_sec, key, cancel),
-                         daemon=True).start()
+        self._ensure_preview_worker()
+        with self._preview_condition:
+            # 常に最新の要求だけを残し、ポインター移動中にffmpegプロセスが
+            # 増殖しないようにする。実行中の1件は完了後に結果を破棄できる。
+            self._preview_job = (self._current_path, pos_sec, key)
+            self._preview_condition.notify()
 
-    def _gen_preview_bg(self, path, pos_sec, key, cancel):
-        img = ffmpeg_thumbnail(path, pos_sec)
-        if cancel.is_set() or img is None:
+    def _ensure_preview_worker(self):
+        if self._preview_worker and self._preview_worker.is_alive():
             return
-        self.root.after(0, lambda i=img, k=key: self._finalize_preview(i, k))
+        self._preview_worker_stop.clear()
+        self._preview_worker = threading.Thread(
+            target=self._preview_worker_loop,
+            name="LumveilPreview",
+            daemon=True,
+        )
+        self._preview_worker.start()
+
+    def _preview_worker_loop(self):
+        while not self._preview_worker_stop.is_set():
+            with self._preview_condition:
+                while (self._preview_job is None and
+                       not self._preview_worker_stop.is_set()):
+                    self._preview_condition.wait()
+                if self._preview_worker_stop.is_set():
+                    return
+                path, pos_sec, key = self._preview_job
+                self._preview_job = None
+
+            img = ffmpeg_thumbnail(path, pos_sec)
+            if self._preview_worker_stop.is_set():
+                return
+            if not self._post_ui(self._finalize_preview, img, key):
+                return
+
+    def _stop_preview_worker(self):
+        if not self._preview_worker:
+            return
+        self._preview_worker_stop.set()
+        with self._preview_condition:
+            self._preview_job = None
+            self._preview_condition.notify_all()
 
     def _finalize_preview(self, img_pil, key):
         if key != self._preview_key:
             return
         self._preview_pending_key = None
+        if img_pil is None:
+            return
         photo = ImageTk.PhotoImage(img_pil)
         self._thumb_cache.put(key, photo)
         self._apply_preview_img(photo)
@@ -4312,9 +5233,10 @@ class VideoPlayer:
         if self._prev_after_id:
             self.root.after_cancel(self._prev_after_id)
             self._prev_after_id = None
-        self._prev_cancel.set()
-        self._preview_key = None
         self._preview_pending_key = None
+        with self._preview_condition:
+            self._preview_job = None
+        self._preview_key = None
         self.prev_popup.withdraw()
 
     # ── 動画クリック（ポーリング）─────────────────────────────────────────
@@ -4360,12 +5282,10 @@ class VideoPlayer:
         except Exception:
             pass
         TITLE_H = 35
-        for win in (getattr(self, "_adj_win", None),
-                    getattr(self, "_gpu_win", None),
-                    getattr(self, "_playlist_popup", None),
-                    getattr(self, "prev_popup", None),
-                    getattr(self, "_about_win", None),
-                    getattr(self, "_menu_popup", None)):
+        # Include all current popups, including quality/volume/navigation.
+        for win in self.root.winfo_children():
+            if not isinstance(win, tk.Toplevel):
+                continue
             try:
                 if win and win.winfo_viewable():
                     ox = win.winfo_rootx()
@@ -4422,6 +5342,11 @@ class VideoPlayer:
     # ── キーバインド ──────────────────────────────────────────────────────
 
     def _bind_keys(self):
+        self.root.bind("<Control-o>", lambda e: self.open_file())
+        self.root.bind("<F1>", lambda e: self._show_shortcuts())
+        self.root.bind("j", lambda e: self._show_time_jump())
+        self.root.bind("<Prior>", lambda e: self._play_relative_chapter(-1))
+        self.root.bind("<Next>", lambda e: self._play_relative_chapter(1))
         self.root.bind("<space>",   lambda e: self.toggle_play())
         self.root.bind("<Left>",    lambda e: self.seek_backward())
         self.root.bind("<Right>",   lambda e: self.seek_forward())
@@ -4435,15 +5360,15 @@ class VideoPlayer:
         self.root.bind("t",         lambda e: self._toggle_always_on_top())
         self.root.bind("<Control-Right>", lambda e: self._play_next())
         self.root.bind("<Control-Left>",  lambda e: self._play_prev())
-        self.root.bind("i",         lambda e: self.player.command("script-binding", "stats/display-stats-toggle"))
-        self.root.bind("I",         lambda e: self.player.command("script-binding", "stats/display-stats-toggle"))
+        self.root.bind("i",         lambda e: self._show_playback_info())
+        self.root.bind("I",         lambda e: self._show_playback_info())
         self.root.bind_all("<MouseWheel>", self._on_mousewheel)
         self.root.bind_all("<Button-3>", self._on_right_click)
 
     def _on_mousewheel(self, event):
-        handler = getattr(self, "_advanced_wheel_handler", None)
-        if handler and handler(event) == "break":
-            return "break"
+        for handler in self._scroll_wheel_handlers:
+            if handler(event) == "break":
+                return "break"
         # bind_allは画面座標が動画キャンバスと重なっていれば発火するため、
         # サブウィンドウ（設定画面等、動画キャンバスに重ねて開く）が前面にある
         # 状態でホイール操作すると音量が変わってしまうクリック貫通と同種のバグを防ぐ。
@@ -4508,6 +5433,7 @@ class VideoPlayer:
     def _toggle_rt_adj(self):
         if self._rt_enabled:
             self._rt_enabled = False
+            self._rt_generation += 1
             self._rt_stop.set()
             self._rt_btn.config(text="リアルタイム自動調整: OFF")
             self._set_button_selected(self._rt_btn, False)
@@ -4542,8 +5468,12 @@ class VideoPlayer:
                 self._rt_current[k] = v
                 self._rt_targets[k] = v
             self._rt_enabled  = True
+            self._rt_generation += 1
             self._rt_baseline = None
-            self._rt_stop.clear()
+            self._manual_status_stats = None
+            # Never clear an event an older worker still owns.
+            self._rt_stop = threading.Event()
+            self._rt_applied_values.clear()
             self._apply_glsl_shaders()
             if hasattr(self, "_shadow_lift_scale"):
                 self._shadow_lift_scale.config(state=tk.DISABLED)
@@ -4551,17 +5481,64 @@ class VideoPlayer:
             self._set_button_selected(self._rt_btn, True, "success")
             self._auto_adj_status.set("ベースライン解析中...")
             self._sync_rt_mode_buttons()
-            self._rt_thread = threading.Thread(target=self._rt_loop, daemon=True)
+            self._rt_thread = threading.Thread(
+                target=self._rt_loop,
+                args=(self._rt_stop, self._rt_generation),
+                name="LumveilAutoAdjust", daemon=True)
+            self._rt_threads = [thread for thread in self._rt_threads if thread.is_alive()]
+            self._rt_threads.append(self._rt_thread)
             self._rt_thread.start()
 
-    def _rt_establish_baseline(self, path, duration_sec):
+    def _rt_worker_valid(self, stop_event, generation, media_generation=None):
+        return (not self._closing and self._rt_enabled and not stop_event.is_set()
+                and generation == self._rt_generation
+                and (media_generation is None
+                     or media_generation == self._media_generation))
+
+    def _finish_rt_result(self, stop_event, generation, media_generation,
+                          baseline, targets, status):
+        """Only the UI thread may commit a worker's correction/status snapshot."""
+        if not self._rt_worker_valid(stop_event, generation, media_generation):
+            return
+        self._rt_baseline = baseline
+        if targets is not None:
+            self._rt_targets = targets
+        self._auto_adj_status.set(status)
+
+    def _rt_establish_baseline(self, path, duration_sec, stop_event=None,
+                              generation=None, media_generation=None):
+        stop_event = stop_event if stop_event is not None else self._rt_stop
+
+        def cancelled():
+            return (stop_event.is_set() or self._closing
+                    or (generation is not None and
+                        not self._rt_worker_valid(stop_event, generation, media_generation))
+                    or (media_generation is not None and
+                        media_generation != self._media_generation))
+
+        if cancelled():
+            return None
+        try:
+            stat = os.stat(path)
+            cache_key = (os.path.normcase(os.path.abspath(path)), stat.st_mtime_ns,
+                         stat.st_size, round(duration_sec, 3))
+        except OSError:
+            cache_key = None
+        if cache_key is not None:
+            with self._rt_baseline_cache_lock:
+                if cache_key in self._rt_baseline_cache:
+                    baseline = self._rt_baseline_cache.pop(cache_key)
+                    self._rt_baseline_cache[cache_key] = baseline
+                    return dict(baseline) if baseline is not None else None
         # 32点サンプル（均等分布 + 前後端）で正常フレームをより多く確保
         ratios = [i / 31 for i in range(1, 31)] + [0.02, 0.98]
         samples = []
         for r in ratios:
-            if self._rt_stop.is_set():
+            if cancelled():
                 return None
             stats = analyze_frame(path, r * duration_sec)
+            if cancelled():
+                return None
             if stats:
                 samples.append(stats)
 
@@ -4575,78 +5552,94 @@ class VideoPlayer:
                     if s["lum_mean"] >= 70.0 and s["lum_std"] >= 20.0]
         if len(good) < 3:
             good = [s for s in samples if s["lum_mean"] >= 50.0]
-        if not good:
-            return None
-
         # 上位15件平均でベースラインを安定化
         top = sorted(good, key=lambda s: s["lum_mean"] * s["lum_std"], reverse=True)[:15]
-        return {
+        baseline = {
             "lum_mean": sum(s["lum_mean"] for s in top) / len(top),
             "lum_std":  sum(s["lum_std"]  for s in top) / len(top),
             "chroma":   sum(s["chroma"]   for s in top) / len(top),
-        }
+        } if top else None
+        if cache_key is not None and not cancelled():
+            try:
+                stat = os.stat(path)
+                unchanged = (stat.st_mtime_ns, stat.st_size) == cache_key[1:3]
+            except OSError:
+                unchanged = False
+            if not unchanged:
+                return None
+            with self._rt_baseline_cache_lock:
+                self._rt_baseline_cache[cache_key] = baseline
+                while len(self._rt_baseline_cache) > 8:
+                    del self._rt_baseline_cache[next(iter(self._rt_baseline_cache))]
+        return baseline
 
-    def _rt_loop(self):
+    @staticmethod
+    def _rt_sample_due(paused, signature, previous_signature, elapsed, force=False):
+        return (not paused or force or signature != previous_signature or elapsed >= 5.0)
+
+    def _rt_loop(self, stop_event, generation):
         # MPV整数空間（0=中立）で暗闇補正を計算する。
         EXTREME_RATIO = 0.05
         INTENT_SECS   = 3.0
 
-        path     = self._current_path
-        duration = self._get_duration_ms() / 1000.0
-        # 初回確立を実行できなかった場合(pathなし/duration未確定)は bl_path を None にして
-        # ループ内の再解析ブロックで再試行させる。確立を実行した場合は結果が None でも
-        # bl_path を維持し、明るいフレームが無い動画への無限リトライを防ぐ。
-        bl_path  = path if (path and duration > 0) else None
-        if path and duration > 0:
-            bl = self._rt_establish_baseline(path, duration)
-            if bl and not self._rt_stop.is_set():
-                self._rt_baseline = bl
-                self.root.after(0, lambda b=bl: self._auto_adj_status.set(
-                    f"ベースライン確立  輝度:{b['lum_mean']:.0f}  "
-                    f"コントラスト指標:{b['lum_std']:.0f}"))
-            elif not self._rt_stop.is_set():
-                self.root.after(0, lambda: self._auto_adj_status.set(
-                    "⚠ 明るいフレームが見つかりません"))
-
+        base_adj = dict(self._rt_base_adj)
+        bl_generation = None
+        bl = None
         dark_start_time = None
+        sample_signature = None
+        sample_time = 0.0
+        sample_wall_time = 0.0
 
-        while self._rt_enabled and not self._rt_stop.is_set():
+        while self._rt_worker_valid(stop_event, generation):
+            media_generation = self._media_generation
+            path = self._current_path
+
+            def post_result(status, targets=None):
+                self._post_ui(self._finish_rt_result, stop_event, generation,
+                              media_generation, bl, targets, status)
+
             # 動画が切り替わった場合、古い動画のベースラインを新動画に適用し続けないよう
             # 補正ターゲットを基準値へ戻した上でベースラインを再解析する。
-            if self._current_path != bl_path:
-                self._rt_baseline = None
-                self._rt_targets.update(self._rt_base_adj)
-                self._rt_targets["shadow_lift"] = 0.0
-                self.root.after(0, lambda: self._auto_adj_status.set("ベースライン再解析中..."))
-                new_path = self._current_path
-                new_duration = self._get_duration_ms() / 1000.0
-                if not new_path or new_duration <= 0:
+            if media_generation != bl_generation:
+                bl = None
+                post_result("ベースライン解析中...", dict(base_adj, shadow_lift=0.0))
+                duration = self._get_duration_ms() / 1000.0
+                if not path or duration <= 0:
                     # 動画切替直後は duration が未確定な場合があるため、次周期に持ち越す。
-                    self._rt_stop.wait(0.5)
+                    stop_event.wait(0.5)
                     continue
-                bl = self._rt_establish_baseline(new_path, new_duration)
-                if self._rt_stop.is_set():
-                    break
-                bl_path = new_path
+                bl = self._rt_establish_baseline(path, duration, stop_event,
+                                                generation, media_generation)
+                if not self._rt_worker_valid(stop_event, generation, media_generation):
+                    continue
+                bl_generation = media_generation
                 dark_start_time = None
                 if bl:
-                    self._rt_baseline = bl
-                    self.root.after(0, lambda b=bl: self._auto_adj_status.set(
-                        f"ベースライン確立  輝度:{b['lum_mean']:.0f}  "
-                        f"コントラスト指標:{b['lum_std']:.0f}"))
+                    post_result(f"ベースライン確立  輝度:{bl['lum_mean']:.0f}  "
+                                f"コントラスト指標:{bl['lum_std']:.0f}")
                 else:
-                    self.root.after(0, lambda: self._auto_adj_status.set(
-                        "⚠ 明るいフレームが見つかりません"))
+                    post_result("⚠ 明るいフレームが見つかりません")
 
-            path   = self._current_path
             pos_ms = self._get_time_ms()
-            bl     = self._rt_baseline
             if path and pos_ms >= 0 and bl:
                 # screenshot_rawはmpv equalizer適用後の画を返すため、測定値を
                 # ソース空間(ベースラインと同じ空間)へ逆補正する。これを怠ると
                 # 補正量が測定に跳ね返る自己フィードバックで発振する(実測で確認済み)。
                 # mpv実式: out = in*k_c + 2.55*b(実測校正)、chroma_out = chroma*k_s
-                cur_adj = self._rt_current
+                cur_adj = dict(self._rt_current)
+                signature = (media_generation, round(pos_ms, 1), self._rt_analysis_revision,
+                             self._rt_mode, self._dark_thresh,
+                             tuple(int(round(cur_adj.get(key, 0.0))) for key in
+                                   ("brightness", "contrast", "gamma", "saturation")),
+                             round(cur_adj.get("shadow_lift", 0.0), 3))
+                # Finish the existing three-second intentional-darkness decay even
+                # if playback was paused before it reached its floor.
+                intent_pending = (dark_start_time is not None and
+                                  sample_wall_time < dark_start_time + INTENT_SECS)
+                if not self._rt_sample_due(self._cached_pause, signature, sample_signature,
+                                           time.monotonic() - sample_time, intent_pending):
+                    stop_event.wait(0.5)
+                    continue
                 # コントラストの+100超過分はGLSL側でありscreenshot_rawに映らないため、
                 # 逆補正はmpvへ実際に渡る+100までで頭打ちにする。
                 k_c = max(0.01, 1.0 + min(100.0, cur_adj.get("contrast", 0.0)) / 100.0)
@@ -4655,7 +5648,10 @@ class VideoPlayer:
                 dark_thresh = min(255, int(60 * k_c + 2.55 * b_adj))
 
                 stats = analyze_current_frame(self.player, dark_thresh=dark_thresh)
-                if stats and not self._rt_stop.is_set():
+                if stats and self._rt_worker_valid(stop_event, generation, media_generation):
+                    sample_signature = signature
+                    sample_time = time.monotonic()
+                    sample_wall_time = time.time()
                     cur_mean = max(0.0, (stats["lum_mean"] - 2.55 * b_adj) / k_c)
                     cur_std  = stats["lum_std"] / k_c
                     cur_chroma = stats["chroma"] / k_s
@@ -4681,11 +5677,9 @@ class VideoPlayer:
 
                     if dark_factor < 0.02:
                         dark_start_time = None
-                        self._rt_targets.update(self._rt_base_adj)
-                        self._rt_targets["shadow_lift"] = 0.0
-                        self.root.after(0, lambda rm=ratio_mean, rs=ratio_std:
-                            self._auto_adj_status.set(
-                                f"✓ 補正なし(十分明るい場面)  輝度比:{rm:.2f}  コントラスト比:{rs:.2f}"))
+                        post_result(f"✓ 補正なし(十分明るい場面)  輝度比:{ratio_mean:.2f}  "
+                                    f"コントラスト比:{ratio_std:.2f}",
+                                    dict(base_adj, shadow_lift=0.0))
                     else:
                         strength, intent_floor = RT_MODES.get(
                             self._rt_mode, RT_MODES["標準"])
@@ -4747,11 +5741,11 @@ class VideoPlayer:
 
                         def with_base(key, adjustment):
                             return max(-100.0, min(100.0,
-                                self._rt_base_adj[key] + adjustment))
+                                base_adj[key] + adjustment))
 
                         brightness_tgt = with_base("brightness", brightness_adj)
                         contrast_total = max(-100.0, min(300.0,
-                            self._rt_base_adj["contrast"] + contrast_adj))
+                            base_adj["contrast"] + contrast_adj))
                         contrast_tgt = contrast_total
                         # ガンマの自動連動は撤去。実効コントラストのシェーダーを
                         # 中間点(pivot)基準の計算に修正した結果、以前のように
@@ -4761,13 +5755,13 @@ class VideoPlayer:
                         gamma_tgt = with_base("gamma", 0.0)
                         saturation_tgt = with_base("saturation", saturation_adj)
 
-                        self._rt_targets.update({
+                        targets = {
                             "gamma":       gamma_tgt,
                             "brightness":  brightness_tgt,
                             "contrast":    contrast_tgt,
                             "saturation":  saturation_tgt,
                             "shadow_lift": shadow_lift_tgt,
-                        })
+                        }
 
                         mode_name = self._rt_mode
                         if is_extreme:
@@ -4779,9 +5773,8 @@ class VideoPlayer:
                         else:
                             status_text = (f"🔄 暗部を補正中({mode_name})"
                                            f"  強さ:{shadow_lift_tgt:.2f}")
-                        self.root.after(0,
-                            lambda t=status_text: self._auto_adj_status.set(t))
-            self._rt_stop.wait(0.5)
+                        post_result(status_text, targets)
+            stop_event.wait(0.5)
 
     def _rt_blend_step(self):
         """MPV整数空間でEMAブレンドして直接適用"""
@@ -4796,12 +5789,17 @@ class VideoPlayer:
                 else:
                     new_val = cur
                 mpv_val = int(round(new_val))
-                self._adj_vars[key][0].set(mpv_val)
+                if self._adj_vars[key][0].get() != mpv_val:
+                    self._adj_vars[key][0].set(mpv_val)
+                if self._rt_applied_values.get(key) == mpv_val:
+                    continue
                 if key == "contrast":
-                    self._apply_effective_contrast(mpv_val)
+                    if self._apply_effective_contrast(mpv_val, flush=False):
+                        self._rt_applied_values[key] = mpv_val
                 else:
                     try:
                         self.player[key] = mpv_val
+                        self._rt_applied_values[key] = mpv_val
                     except Exception:
                         pass
 
@@ -4811,7 +5809,8 @@ class VideoPlayer:
             if abs(sl_cur - sl_tgt) > 0.005:
                 sl_new = sl_cur + (sl_tgt - sl_cur) * ALPHA
                 self._rt_current["shadow_lift"] = sl_new
-                self._apply_shadow_lift(sl_new)
+                self._apply_shadow_lift(sl_new, flush=False)
+            self._apply_shader_opts()
 
     def _blend_loop(self):
         if self._rt_enabled:
@@ -4826,21 +5825,87 @@ class VideoPlayer:
             ratio = "--"
             correction = "手動"
             if self._rt_baseline:
-                stats = analyze_current_frame(self.player)
+                stats = self._manual_status_stats
                 if stats:
                     ratio = f"{stats['lum_mean'] / max(self._rt_baseline['lum_mean'], 1.0):.2f}"
+                self._schedule_manual_status_stats()
             self._auto_adj_status.set(
                 f"手動  比率:{ratio}  補正:{correction}"
                 f"  B:{values['brightness']:+d}  γ:{values['gamma']:+d}"
                 f"  C:{values['contrast']:+d}  S:{values['saturation']:+d}")
         self.root.after(1000, self._manual_status_loop)
 
+    def _schedule_manual_status_stats(self):
+        """UIを止めずに手動画面の明るさ比率を更新する。"""
+        if (self._manual_status_pending or not self._current_path or
+                not self._rt_baseline):
+            return
+        self._manual_status_pending = True
+        path = self._current_path
+        baseline = self._rt_baseline
+        threading.Thread(
+            target=self._manual_status_stats_worker,
+            args=(path, baseline),
+            name="LumveilManualStats",
+            daemon=True,
+        ).start()
+
+    def _manual_status_stats_worker(self, path, baseline):
+        try:
+            stats = analyze_current_frame(self.player)
+        except Exception:
+            stats = None
+        self._post_ui(self._finish_manual_status_stats,
+                      path, baseline, stats)
+
+    def _finish_manual_status_stats(self, path, baseline, stats):
+        self._manual_status_pending = False
+        if (self._rt_enabled or path != self._current_path or
+                baseline is not self._rt_baseline):
+            return
+        self._manual_status_stats = stats
+
     # ── 定期更新ループ ────────────────────────────────────────────────────
 
+    def _post_ui(self, callback, *args, **kwargs):
+        """Queue a worker result without entering Tcl from a worker thread."""
+        if self._closing:
+            return False
+        try:
+            self._ui_dispatch_queue.put_nowait((callback, args, kwargs))
+            return True
+        except Exception:
+            return False
+
+    def _drain_ui_queue(self):
+        """Run a bounded batch of worker callbacks on Tk's main thread."""
+        if self._closing:
+            while True:
+                try:
+                    self._ui_dispatch_queue.get_nowait()
+                except queue.Empty:
+                    return
+        for _ in range(64):
+            try:
+                callback, args, kwargs = self._ui_dispatch_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                callback(*args, **kwargs)
+            except (tk.TclError, RuntimeError):
+                if self._closing:
+                    return
+
     def _update_loop(self):
+        if self._closing:
+            return
+        self._drain_ui_queue()
+        self._drain_mpv_events()
+        self._refresh_playback_state()
         if not self.is_seeking:
             dur_ms = self._get_duration_ms()
             pos_ms = self._get_time_ms()
+            self._cached_time_ms = pos_ms
             if dur_ms > 0:
                 self.seek_var.set(pos_ms / dur_ms * 1000)
             tc = self._fmt(int(pos_ms))
@@ -4854,6 +5919,54 @@ class VideoPlayer:
             self.play_btn.config(text=new_icon)
 
         self.root.after(200, self._update_loop)
+
+    def _refresh_playback_state(self):
+        state = []
+        if self._playback_eof_action == "repeat":
+            state.append("リピート")
+        if self._muted:
+            state.append("ミュート")
+        if self._rt_enabled:
+            state.append("AUTO解析中" if self._rt_baseline is None else f"AUTO: {self._rt_mode}")
+        self._playback_state_var.set(" / ".join(state))
+
+    def _drain_mpv_events(self):
+        """Apply coalesced mpv notifications on Tk's main thread only."""
+        with self._mpv_event_lock:
+            duration = self._mpv_pending_duration
+            pause = self._mpv_pending_pause
+            eof = self._mpv_pending_eof
+            file_loaded = self._mpv_pending_file_loaded
+            self._mpv_pending_duration = _MPV_EVENT_PENDING
+            self._mpv_pending_pause = _MPV_EVENT_PENDING
+            self._mpv_pending_eof = None
+            self._mpv_pending_file_loaded = False
+
+        if duration is not _MPV_EVENT_PENDING:
+            self._on_duration_prop(duration)
+        if pause is not _MPV_EVENT_PENDING:
+            self._on_pause_prop(pause)
+        if not self._closing and self._eof_matches_current_file(eof):
+            self._on_eof_reached()
+        if file_loaded and not self._closing:
+            self._handle_mpv_file_loaded()
+
+    def _on_mpv_eof(self, value):
+        with self._mpv_event_lock:
+            self._mpv_pending_eof = ((self._media_generation, self._current_path)
+                                     if value else None)
+
+    def _eof_matches_current_file(self, eof):
+        if not self._current_path or eof != (self._media_generation, self._current_path):
+            return False
+        try:
+            # A notification from the previous load can arrive after play().
+            # Confirm the native player really ended the current file as well.
+            return (bool(self.player.eof_reached) and
+                    os.path.normcase(os.path.abspath(self.player.path)) ==
+                    os.path.normcase(os.path.abspath(self._current_path)))
+        except Exception:
+            return False
 
     @staticmethod
     def _fmt(ms):
@@ -4889,13 +6002,62 @@ def _restore_window_geometry(root):
         root.geometry(DEFAULT)
 
 
+def _launch_file_paths(args):
+    """Return unique existing paths supplied by the shell/file association."""
+    paths = []
+    seen = set()
+    for raw_path in args:
+        if not isinstance(raw_path, str):
+            continue
+        try:
+            path = os.path.abspath(raw_path)
+            key = os.path.normcase(path)
+            if key not in seen and os.path.isfile(path):
+                paths.append(path)
+                seen.add(key)
+        except (OSError, TypeError):
+            continue
+    return paths
+
+
 def main():
-    root = TkinterDnD.Tk()
-    _restore_window_geometry(root)
-    app = VideoPlayer(root)
-    if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
-        root.after(500, lambda: app._open_path(sys.argv[1]))
-    root.mainloop()
+    single_instance = _SingleInstance.acquire()
+    launch_paths = _launch_file_paths(sys.argv[1:])
+    if not single_instance.primary:
+        # The primary may still be constructing Tk/mpv, so forward with a
+        # bounded retry instead of accidentally starting a second player.
+        single_instance.forward_paths(launch_paths)
+        return
+
+    forwarded_messages = queue.Queue()
+    single_instance.start_server(forwarded_messages)
+    root = None
+    try:
+        root = TkinterDnD.Tk()
+        _restore_window_geometry(root)
+        app = VideoPlayer(root)
+
+        def drain_forwarded_messages():
+            try:
+                while True:
+                    app._open_external_paths(forwarded_messages.get_nowait())
+            except queue.Empty:
+                pass
+            except tk.TclError:
+                return
+            try:
+                root.after(100, drain_forwarded_messages)
+            except tk.TclError:
+                pass
+
+        if launch_paths:
+            # Put the original launch before any second-instance handoffs so
+            # near-simultaneous file opens retain FIFO ordering.
+            forwarded_messages.put(launch_paths)
+        root.after(0, drain_forwarded_messages)
+        root.mainloop()
+    finally:
+        single_instance.close()
 
 
 if __name__ == "__main__":

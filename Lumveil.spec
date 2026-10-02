@@ -5,7 +5,7 @@ a = Analysis(
     ['lumveil.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('shaders', 'shaders')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

@@ -39,12 +39,53 @@ def _exe_path():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), EXE_NAME)
 
 
+def _query_value(path, name):
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0, winreg.KEY_READ) as key:
+        return winreg.QueryValueEx(key, name)
+
+
 def _associate(ext, exe):
     prog_id = f"Lumveil{ext.replace('.', '')}"
+    ext_key = rf"Software\Classes\{ext}"
+    prog_key = rf"Software\Classes\{prog_id}"
     try:
+        extension = winreg.CreateKey(winreg.HKEY_CURRENT_USER, ext_key)
+        try:
+            previous, previous_type = winreg.QueryValueEx(extension, "")
+            had_previous = True
+        except OSError:
+            previous, previous_type, had_previous = None, winreg.REG_SZ, False
+
+        # Keep the prior default so the user's previous choice can be restored.
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, prog_key) as k:
+            try:
+                saved_present, _ = winreg.QueryValueEx(
+                    k, "LumveilPreviousDefaultPresent")
+                saved, _ = winreg.QueryValueEx(k, "LumveilPreviousDefault")
+                saved_exists = bool(saved_present)
+            except OSError:
+                saved, saved_exists = None, False
+            if previous != prog_id or not saved_exists:
+                if had_previous and previous != prog_id:
+                    winreg.SetValueEx(k, "LumveilPreviousDefault", 0,
+                                      previous_type, previous)
+                    winreg.SetValueEx(k, "LumveilPreviousDefaultPresent", 0,
+                                      winreg.REG_DWORD, 1)
+                else:
+                    try:
+                        winreg.DeleteValue(k, "LumveilPreviousDefault")
+                    except OSError:
+                        pass
+                    winreg.SetValueEx(k, "LumveilPreviousDefaultPresent", 0,
+                                      winreg.REG_DWORD, 0)
+
+        try:
+            extension.Close()
+        except AttributeError:
+            pass
+
         # HKCU\Software\Classes\<ext> → ProgID
-        with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
-                              rf"Software\Classes\{ext}") as k:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, ext_key) as k:
             winreg.SetValueEx(k, "", 0, winreg.REG_SZ, prog_id)
 
         # HKCU\Software\Classes\<ProgID>\shell\open\command
@@ -62,35 +103,121 @@ def _associate(ext, exe):
         return False
 
 
-def _unassociate(ext):
-    prog_id = f"Lumveil{ext.replace('.', '')}"
+def _delete_value_if_matches(path, name, expected):
+    """Delete a Lumveil-owned registry value without removing sibling data."""
     try:
-        # ext キーの既定値が自分のものなら削除
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                            rf"Software\Classes\{ext}",
-                            0, winreg.KEY_READ) as k:
-            val, _ = winreg.QueryValueEx(k, "")
-            if val != prog_id:
-                return True  # 他アプリの関連付けは触らない
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0,
+                            winreg.KEY_READ | winreg.KEY_WRITE) as key:
+            value, _ = winreg.QueryValueEx(key, name)
+            if value == expected:
+                winreg.DeleteValue(key, name)
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
 
-        winreg.DeleteKey(winreg.HKEY_CURRENT_USER,
-                         rf"Software\Classes\{ext}")
-    except Exception:
-        pass
+
+def _remove_empty_key(path):
     try:
-        winreg.DeleteKey(winreg.HKEY_CURRENT_USER,
-                         rf"Software\Classes\{prog_id}\shell\open\command")
-        winreg.DeleteKey(winreg.HKEY_CURRENT_USER,
-                         rf"Software\Classes\{prog_id}\shell\open")
-        winreg.DeleteKey(winreg.HKEY_CURRENT_USER,
-                         rf"Software\Classes\{prog_id}\shell")
-        winreg.DeleteKey(winreg.HKEY_CURRENT_USER,
-                         rf"Software\Classes\{prog_id}\DefaultIcon")
-        winreg.DeleteKey(winreg.HKEY_CURRENT_USER,
-                         rf"Software\Classes\{prog_id}")
-    except Exception:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0,
+                            winreg.KEY_READ) as key:
+            subkeys, values, _ = winreg.QueryInfoKey(key)
+        if subkeys or values:
+            return
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, path)
+    except OSError:
+        # Missing, inaccessible, or newly populated keys are left untouched.
         pass
-    return True
+
+
+def _unassociate(ext, *, expected_exe=None):
+    prog_id = f"Lumveil{ext.replace('.', '')}"
+    ext_key = rf"Software\Classes\{ext}"
+    prog_key = rf"Software\Classes\{prog_id}"
+    exe = expected_exe or _exe_path()
+    command = f'"{exe}" "%1"'
+    icon = f'"{exe}",0'
+    if expected_exe is not None:
+        # An older backup's uninstaller must not unregister a newer install.
+        try:
+            owned_command, _ = _query_value(rf"{prog_key}\shell\open\command", "")
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        if owned_command != command:
+            return True
+    current = None
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, ext_key,
+                            0, winreg.KEY_READ | winreg.KEY_WRITE) as key:
+            current, _ = winreg.QueryValueEx(key, "")
+            if current == prog_id:
+                try:
+                    previous_present, _ = _query_value(
+                        prog_key, "LumveilPreviousDefaultPresent")
+                except OSError:
+                    previous_present = 0
+                if previous_present:
+                    previous, previous_type = _query_value(
+                        prog_key, "LumveilPreviousDefault")
+                    winreg.SetValueEx(key, "", 0, previous_type, previous)
+                else:
+                    winreg.DeleteValue(key, "")
+    except FileNotFoundError:
+        current = None
+    except OSError:
+        return False
+
+    if current != prog_id and expected_exe is None:
+        return not _is_associated(ext)
+
+    # A foreign default is never modified. Legacy installs without a saved
+    # default have their Lumveil value removed while preserving the ext key.
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, ext_key,
+                            0, winreg.KEY_READ) as key:
+            try:
+                remaining, _ = winreg.QueryValueEx(key, "")
+            except FileNotFoundError:
+                remaining = None
+    except FileNotFoundError:
+        remaining = None
+    except OSError:
+        return False
+    if remaining == prog_id:
+        return False
+
+    # Remove only the exact command/icon values created by this application.
+    # Leave the command until the icon is handled, so a failed uninstall can
+    # retry ownership detection instead of silently leaving a dangling path.
+    if not _delete_value_if_matches(rf"{prog_key}\DefaultIcon", "", icon):
+        return False
+    if not _delete_value_if_matches(rf"{prog_key}\shell\open\command", "", command):
+        return False
+    for path in (rf"{prog_key}\shell\open\command",
+                 rf"{prog_key}\shell\open", rf"{prog_key}\shell",
+                 rf"{prog_key}\DefaultIcon"):
+        _remove_empty_key(path)
+
+    # Drop saved metadata only after the extension default was removed/restored.
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, prog_key, 0,
+                            winreg.KEY_READ | winreg.KEY_WRITE) as key:
+            for name in ("LumveilPreviousDefaultPresent",
+                         "LumveilPreviousDefault"):
+                try:
+                    winreg.DeleteValue(key, name)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    for path in (rf"{prog_key}\shell\open\command",
+                 rf"{prog_key}\shell\open", rf"{prog_key}\shell",
+                 rf"{prog_key}\DefaultIcon", prog_key):
+        _remove_empty_key(path)
+    return not _is_associated(ext)
 
 
 def _notify_shell():
@@ -215,13 +342,25 @@ class AssocTool:
         if not targets:
             messagebox.showwarning("警告", "拡張子を1つ以上選択してください")
             return
-        for ext in targets:
-            _unassociate(ext)
+        results = [_unassociate(ext) for ext in targets]
         _notify_shell()
-        self._status.set(f"✓ {len(targets)}件 解除しました")
+        succeeded = sum(results)
+        if succeeded == len(targets):
+            self._status.set(f"✓ {succeeded}件 解除しました")
+        else:
+            self._status.set(f"⚠ {succeeded}/{len(targets)}件を解除しました")
 
 
-def main():
+def main(argv=None):
+    arguments = sys.argv[1:] if argv is None else argv
+    if arguments:
+        if arguments != ["--unassociate-all"]:
+            return 2
+        # No GUI/elevation recursion; the uninstaller supplies its own context.
+        exe = _exe_path()
+        results = [_unassociate(ext, expected_exe=exe) for ext in EXTENSIONS]
+        _notify_shell()
+        return 0 if all(results) else 1
     if not _is_admin():
         ctypes.windll.shell32.ShellExecuteW(
             None, "runas", sys.executable, " ".join(sys.argv), None, 1)
@@ -230,7 +369,8 @@ def main():
     root = tk.Tk()
     AssocTool(root)
     root.mainloop()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

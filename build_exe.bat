@@ -2,7 +2,7 @@
 cd /d "%~dp0"
 
 echo ========================================
-echo  Lumveil 2.0.0 - Release Build
+echo  Lumveil 2.1.0 - Release Build
 echo ========================================
 
 set "PYTHON_EXE=%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
@@ -22,6 +22,7 @@ echo [INFO] Building Lumveil...
   --windowed ^
   --name Lumveil ^
   --icon Lumveil.ico ^
+  --add-data "shaders:shaders" ^
   --clean ^
   --noconfirm ^
   lumveil.py
@@ -65,7 +66,8 @@ if not exist "%MAKENSIS%" (
 )
 
 echo [INFO] Building installer...
-"%MAKENSIS%" installer\Lumveil.nsi
+if not exist build\distribution mkdir build\distribution
+"%MAKENSIS%" /INPUTCHARSET UTF8 /DOUTFILE=build\distribution\Lumveil_v2.1.0_Setup.exe installer\Lumveil.nsi
 if errorlevel 1 (
     echo [ERROR] Installer build failed.
     exit /b 1
@@ -73,5 +75,5 @@ if errorlevel 1 (
 
 echo.
 echo ========================================
-echo  Done: dist\Lumveil_v2.0.0_Setup.exe
+echo  Done: build\distribution\Lumveil_v2.1.0_Setup.exe
 echo ========================================
